@@ -40,6 +40,14 @@ GHL_LOCATION_ID    = os.environ.get("GHL_LOCATION_ID",    "n4rqgABEMiHBL5Ui84JV"
 GHL_BASE_URL       = os.environ.get("GHL_BASE_URL",       "https://services.leadconnectorhq.com")
 PORT               = int(os.environ.get("PORT",           "8000"))
 
+# Stripe Configuration
+STRIPE_API_KEY     = os.environ.get("STRIPE_API_KEY",     "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+import stripe
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
+
 # Google Service Account JSON — stored as a single-line JSON string in the env var
 GOOGLE_SA_JSON     = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
@@ -469,7 +477,263 @@ def handle_appointment_status(body: dict):
     sheets_update_cell(existing_row, "G", showed_value)
     logger.info(f"Updated Showed to '{showed_value}' for {email} at row {existing_row}")
 
-# ─── Webhook Endpoint ─────────────────────────────────────────
+# ─── Stripe Helpers ─────────────────────────────────────────────
+
+def get_exchange_rate(from_currency: str, to_currency: str = "AUD") -> float:
+    """Fetch exchange rate using a free API. Fallback to 1.0 if it fails."""
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
+    if from_currency == to_currency:
+        return 1.0
+    try:
+        # Using a free open API for exchange rates
+        r = http_requests.get(f"https://open.er-api.com/v6/latest/{from_currency}", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        rate = data.get("rates", {}).get(to_currency)
+        if rate:
+            return float(rate)
+    except Exception as e:
+        logger.error(f"Failed to fetch exchange rate for {from_currency} to {to_currency}: {e}")
+    return 1.0
+
+def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
+    """
+    Fetch subscription details from Stripe.
+    Returns (number_of_payments, total_contracted_revenue_in_original_currency).
+
+    Strategy:
+    1. If a SubscriptionSchedule is attached, use its phases to count total billing
+       cycles and multiply by the per-cycle amount.
+    2. Otherwise, fall back to the subscription's metadata field 'total_payments'
+       (if set), or use the billing_cycle_anchor + cancel_at to estimate cycles.
+    3. If none of the above is available, default to 1 payment (the current invoice).
+    """
+    if not STRIPE_API_KEY or not subscription_id:
+        return 1, 0.0
+    try:
+        sub = stripe.Subscription.retrieve(
+            subscription_id,
+            expand=['schedule']
+        )
+
+        # Per-cycle amount from subscription items
+        per_cycle_amount = 0.0
+        for item in sub.get('items', {}).get('data', []):
+            price = item.get('price', {})
+            quantity = item.get('quantity', 1)
+            unit_amount = price.get('unit_amount', 0) / 100.0
+            per_cycle_amount += unit_amount * quantity
+
+        num_payments = 1  # default
+
+        # --- Strategy 1: SubscriptionSchedule phases ---
+        schedule = sub.get('schedule')
+        if schedule and isinstance(schedule, dict):
+            phases = schedule.get('phases', [])
+            total_iterations = 0
+            for phase in phases:
+                iterations = phase.get('iterations')  # None means open-ended
+                if iterations:
+                    total_iterations += iterations
+            if total_iterations > 0:
+                num_payments = total_iterations
+                total_amount = per_cycle_amount * num_payments
+                logger.info(f"Subscription {subscription_id}: {num_payments} payments via schedule")
+                return num_payments, total_amount
+
+        # --- Strategy 2: metadata['total_payments'] ---
+        meta_total = sub.get('metadata', {}).get('total_payments')
+        if meta_total:
+            try:
+                num_payments = int(meta_total)
+                total_amount = per_cycle_amount * num_payments
+                logger.info(f"Subscription {subscription_id}: {num_payments} payments via metadata")
+                return num_payments, total_amount
+            except (ValueError, TypeError):
+                pass
+
+        # --- Strategy 3: cancel_at vs billing_cycle_anchor ---
+        cancel_at = sub.get('cancel_at')
+        billing_anchor = sub.get('billing_cycle_anchor')
+        price_data = sub.get('items', {}).get('data', [{}])[0].get('price', {})
+        interval = price_data.get('recurring', {}).get('interval', 'month')
+        interval_count = price_data.get('recurring', {}).get('interval_count', 1)
+
+        if cancel_at and billing_anchor:
+            from datetime import datetime as _dt
+            start_dt = _dt.utcfromtimestamp(billing_anchor)
+            end_dt   = _dt.utcfromtimestamp(cancel_at)
+            delta_days = (end_dt - start_dt).days
+            if interval == 'day':
+                cycles = delta_days / interval_count
+            elif interval == 'week':
+                cycles = delta_days / (7 * interval_count)
+            elif interval == 'month':
+                cycles = delta_days / (30.44 * interval_count)
+            elif interval == 'year':
+                cycles = delta_days / (365.25 * interval_count)
+            else:
+                cycles = 1
+            num_payments = max(1, round(cycles))
+            total_amount = per_cycle_amount * num_payments
+            logger.info(f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate")
+            return num_payments, total_amount
+
+        # Fallback: single payment
+        logger.info(f"Subscription {subscription_id}: defaulting to 1 payment")
+        return 1, per_cycle_amount
+
+    except Exception as e:
+        logger.error(f"Failed to fetch Stripe subscription {subscription_id}: {e}")
+        return 1, 0.0
+
+def handle_stripe_payment(event: dict):
+    """Process a successful Stripe payment."""
+    data_object = event['data']['object']
+    event_type = event['type']
+    
+    customer_email = ""
+    amount_paid = 0.0
+    currency = "aud"
+    payment_date = datetime.now(AEST).strftime("%Y-%m-%d")
+    stripe_payment_id = data_object.get('id', '')
+    subscription_id = None
+
+    if event_type == 'payment_intent.succeeded':
+        customer_email = data_object.get('receipt_email')
+        amount_paid = data_object.get('amount_received', 0) / 100.0
+        currency = data_object.get('currency', 'aud')
+        # Try to get email from customer if receipt_email is missing
+        if not customer_email and data_object.get('customer'):
+            try:
+                customer = stripe.Customer.retrieve(data_object['customer'])
+                customer_email = customer.get('email')
+            except Exception:
+                pass
+    elif event_type == 'invoice.payment_succeeded':
+        customer_email = data_object.get('customer_email')
+        amount_paid = data_object.get('amount_paid', 0) / 100.0
+        currency = data_object.get('currency', 'aud')
+        subscription_id = data_object.get('subscription')
+    elif event_type == 'charge.succeeded':
+        customer_email = data_object.get('billing_details', {}).get('email') or data_object.get('receipt_email')
+        amount_paid = data_object.get('amount', 0) / 100.0
+        currency = data_object.get('currency', 'aud')
+    
+    if not customer_email:
+        logger.warning(f"Stripe event {event_type} missing customer email. ID: {stripe_payment_id}")
+        return
+
+    # Convert currency to AUD
+    exchange_rate = get_exchange_rate(currency, "AUD")
+    amount_aud = amount_paid * exchange_rate
+
+    # Get subscription details if applicable
+    num_payments = 1
+    contracted_revenue_aud = amount_aud
+    
+    if subscription_id:
+        payments, total_rev = get_stripe_subscription_details(subscription_id)
+        num_payments = payments
+        contracted_revenue_aud = total_rev * exchange_rate
+
+    logger.info(f"Stripe Payment: {customer_email}, Amount: {amount_aud} AUD, Payments: {num_payments}, Rev: {contracted_revenue_aud} AUD")
+
+    # Find row in Google Sheet
+    row_num = find_row_by_email(customer_email)
+    
+    if row_num:
+        # Update existing row
+        sheets_update_cell(row_num, "I", f"{amount_aud:.2f}")
+        sheets_update_cell(row_num, "J", str(num_payments))
+        sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
+        logger.info(f"Updated Stripe payment for {customer_email} at row {row_num}")
+    else:
+        # Append to Unmatched Payments tab
+        logger.info(f"No matching row for {customer_email}. Appending to Unmatched Payments.")
+        append_unmatched_payment([
+            payment_date,
+            customer_email,
+            f"{amount_paid:.2f}",
+            currency.upper(),
+            stripe_payment_id
+        ])
+
+def append_unmatched_payment(values: list[str]):
+    """Append a row to the Unmatched Payments tab, creating it if necessary."""
+    service = get_sheets_service()
+    if not service:
+        return
+    
+    # Check if tab exists, create if not
+    try:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = sheet_metadata.get('sheets', '')
+        tab_exists = any(s.get("properties", {}).get("title") == "Unmatched Payments" for s in sheets)
+        
+        if not tab_exists:
+            # Create tab
+            batch_update_spreadsheet_request_body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {
+                            'title': 'Unmatched Payments'
+                        }
+                    }
+                }]
+            }
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=batch_update_spreadsheet_request_body
+            ).execute()
+            # Add headers
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="'Unmatched Payments'!A1:E1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [["Date", "Email", "Amount", "Currency", "Stripe Payment ID"]]}
+            ).execute()
+            
+        # Append data
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="'Unmatched Payments'!A:E",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Failed to append unmatched payment: {e}")
+
+# ─── Webhook Endpoints ────────────────────────────────────────
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("STRIPE_WEBHOOK_SECRET is not set")
+        return JSONResponse(content={"error": "Webhook secret not configured"}, status_code=500)
+        
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError as e:
+        logger.error("Invalid Stripe payload")
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    except stripe.error.SignatureVerificationError as e:
+        logger.error("Invalid Stripe signature")
+        return JSONResponse(content={"error": "Invalid signature"}, status_code=400)
+        
+    # Handle the event
+    if event['type'] in ['payment_intent.succeeded', 'invoice.payment_succeeded', 'charge.succeeded']:
+        handle_stripe_payment(event)
+        
+    return JSONResponse(content={"status": "success"}, status_code=200)
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -514,20 +778,25 @@ async def webhook(request: Request):
 async def health():
     sa_configured = bool(GOOGLE_SA_JSON)
     ghl_configured = bool(GHL_TOKEN)
+    stripe_configured = bool(STRIPE_API_KEY)
+    stripe_webhook_configured = bool(STRIPE_WEBHOOK_SECRET)
     return {
         "status": "healthy",
         "timestamp": datetime.now(AEST).isoformat(),
         "google_sheets_auth": "configured" if sa_configured else "MISSING — set GOOGLE_SERVICE_ACCOUNT_JSON",
         "ghl_token": "configured" if ghl_configured else "MISSING — set GHL_TOKEN",
+        "stripe_api_key": "configured" if stripe_configured else "MISSING — set STRIPE_API_KEY",
+        "stripe_webhook_secret": "configured" if stripe_webhook_configured else "MISSING — set STRIPE_WEBHOOK_SECRET",
     }
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "GHL Webhook Receiver",
-        "version": "1.2.0",
-        "webhook_endpoint": "POST /webhook",
+        "service": "GHL + Stripe Webhook Receiver",
+        "version": "1.3.0",
+        "ghl_webhook_endpoint": "POST /webhook",
+        "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
     }
 
