@@ -365,13 +365,13 @@ def handle_appointment_created(body: dict):
         return
 
     now_aest    = datetime.now(AEST)
-    date_booked = now_aest.strftime("%d/%m/%Y")
+    date_booked = now_aest.strftime("%Y-%m-%d")
 
     date_of_call = ""
     if start_time_str:
         try:
             dt = datetime.fromisoformat(str(start_time_str).replace("Z", "+00:00"))
-            date_of_call = dt.astimezone(AEST).strftime("%d/%m/%Y")
+            date_of_call = dt.astimezone(AEST).strftime("%Y-%m-%d")
         except Exception:
             # If it's a human-readable string like "Wednesday, 18 March 2026 5:30 PM", keep as-is
             date_of_call = str(start_time_str)[:20] if start_time_str else ""
