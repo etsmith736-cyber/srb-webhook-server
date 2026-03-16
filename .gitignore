@@ -1,0 +1,21 @@
+# Logs
+*.log
+server_output.log
+webhook.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv
+venv/
+env/
+
+# Secrets — never commit these
+*.json.key
+service_account.json
+credentials.json
+
+# OS
+.DS_Store
