@@ -659,13 +659,19 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
     Fetch subscription details from Stripe.
     Returns (number_of_payments, total_contracted_revenue_in_original_currency).
 
-    Strategy:
-    1. If a SubscriptionSchedule is attached, use its phases to count total billing
-       cycles and multiply by the per-cycle amount.
-    2. Otherwise, fall back to the subscription's metadata field 'total_payments'
-       (if set), or use the billing_cycle_anchor + cancel_at to estimate cycles.
-    3. If none of the above is available, default to 1 payment (the current invoice).
+    Strategy priority order:
+    0. ThriveCart metadata 'tc_fixed_rebills':
+         total_payments = int(tc_fixed_rebills) + 1  (rebills after initial payment)
+    1. SubscriptionSchedule phases (iterations sum)
+    2. Generic metadata field 'total_payments'
+    3. cancel_at vs billing_cycle_anchor date-range estimate
+    4. ThriveCart product name parsing:
+         pattern: thrivecart-{id}-{price_cents}-{interval}-aud{rebills}rebills
+         amount overridden from name if Stripe price differs (e.g. $0 trial)
+    5. Default: 1 payment at the Stripe per-cycle amount
     """
+    import re as _re
+
     if not STRIPE_API_KEY or not subscription_id:
         return 1, 0.0
     try:
@@ -674,7 +680,9 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
             expand=['schedule']
         )
 
-        # Per-cycle amount from subscription items
+        metadata = sub.get('metadata', {}) or {}
+
+        # Per-cycle amount from subscription items (Stripe price)
         per_cycle_amount = 0.0
         for item in sub.get('items', {}).get('data', []):
             price = item.get('price', {})
@@ -682,7 +690,23 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
             unit_amount = price.get('unit_amount', 0) / 100.0
             per_cycle_amount += unit_amount * quantity
 
-        num_payments = 1  # default
+        # --- Strategy 0: ThriveCart tc_fixed_rebills metadata (PRIMARY) ---
+        tc_rebills_raw = metadata.get('tc_fixed_rebills')
+        if tc_rebills_raw is not None:
+            try:
+                tc_rebills = int(tc_rebills_raw)
+                num_payments = tc_rebills + 1  # rebills + initial payment
+                total_amount = per_cycle_amount * num_payments
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments "
+                    f"via tc_fixed_rebills={tc_rebills}"
+                )
+                return num_payments, total_amount
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Subscription {subscription_id}: could not parse "
+                    f"tc_fixed_rebills='{tc_rebills_raw}'"
+                )
 
         # --- Strategy 1: SubscriptionSchedule phases ---
         schedule = sub.get('schedule')
@@ -696,16 +720,20 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
             if total_iterations > 0:
                 num_payments = total_iterations
                 total_amount = per_cycle_amount * num_payments
-                logger.info(f"Subscription {subscription_id}: {num_payments} payments via schedule")
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments via schedule"
+                )
                 return num_payments, total_amount
 
-        # --- Strategy 2: metadata['total_payments'] ---
-        meta_total = sub.get('metadata', {}).get('total_payments')
+        # --- Strategy 2: generic metadata['total_payments'] ---
+        meta_total = metadata.get('total_payments')
         if meta_total:
             try:
                 num_payments = int(meta_total)
                 total_amount = per_cycle_amount * num_payments
-                logger.info(f"Subscription {subscription_id}: {num_payments} payments via metadata")
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments via metadata"
+                )
                 return num_payments, total_amount
             except (ValueError, TypeError):
                 pass
@@ -734,10 +762,56 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
                 cycles = 1
             num_payments = max(1, round(cycles))
             total_amount = per_cycle_amount * num_payments
-            logger.info(f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate")
+            logger.info(
+                f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate"
+            )
             return num_payments, total_amount
 
-        # Fallback: single payment
+        # --- Strategy 4: ThriveCart product name parsing ---
+        # Pattern: thrivecart-{product_id}-{price_id}-{amount_cents}-{interval}-aud{rebills}rebills
+        # Example: thrivecart-20196-product-412-110000-month-aud2rebills
+        # The amount in the name is in cents and is always AUD, so it overrides the
+        # Stripe price when the Stripe price is $0 (trial) or otherwise unreliable.
+        product_name = ""
+        items_data = sub.get('items', {}).get('data', [])
+        if items_data:
+            product_name = (
+                items_data[0].get('price', {}).get('product', {})
+                if isinstance(items_data[0].get('price', {}).get('product'), dict)
+                else ""
+            )
+            if not product_name:
+                # product may be just an ID string; try the price nickname or metadata
+                product_name = (
+                    items_data[0].get('price', {}).get('nickname', '') or
+                    metadata.get('tc_product_name', '') or
+                    metadata.get('product_name', '')
+                )
+
+        tc_name_match = _re.search(
+            r'thrivecart-[\w-]+-(?P<cents>\d+)-(?:\w+)-aud(?P<rebills>\d+)rebills',
+            str(product_name),
+            _re.IGNORECASE,
+        )
+        if tc_name_match:
+            try:
+                name_amount = int(tc_name_match.group('cents')) / 100.0
+                name_rebills = int(tc_name_match.group('rebills'))
+                num_payments = name_rebills + 1
+                # Use name amount if Stripe per_cycle_amount looks wrong (e.g. $0)
+                effective_amount = name_amount if per_cycle_amount == 0.0 else per_cycle_amount
+                total_amount = effective_amount * num_payments
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments via "
+                    f"ThriveCart product name (amount={effective_amount})"
+                )
+                return num_payments, total_amount
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Subscription {subscription_id}: ThriveCart name parse failed: {e}"
+                )
+
+        # --- Strategy 5: default — single payment ---
         logger.info(f"Subscription {subscription_id}: defaulting to 1 payment")
         return 1, per_cycle_amount
 
@@ -990,7 +1064,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.4.1",
+        "version": "1.4.2",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
