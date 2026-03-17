@@ -1,16 +1,25 @@
 """
-GHL → Google Sheets Webhook Receiver
-=====================================
-Receives appointment events from Go High Level workflows and writes
-them to the "Sales Calls" tab in the SRB Master Spreadsheet.
+GHL + Stripe → Google Sheets Webhook Receiver
+===============================================
+Receives events from Go High Level workflows and Stripe, writing
+results to the "Sales Calls" tab in the SRB Master Spreadsheet.
 
-Two event types:
-  1. appointment_created  → add/update a row (dedup by email)
-  2. appointment_status   → update the Showed column only
+Event types handled:
+  1. appointment_created        → add/update a row (dedup by email)
+  2. appointment_status         → update the Showed column (G) only
+  3. opportunity_stage_update   → on "Won (Closed)": mark H=Closed,
+                                   look up Stripe for I/J/K, or
+                                   highlight row yellow if no data
+
+Stripe webhook (POST /stripe-webhook):
+  4. payment_intent.succeeded   → update I/J/K or append Unmatched
+  5. invoice.payment_succeeded  → update I/J/K or append Unmatched
+  6. charge.succeeded           → update I/J/K or append Unmatched
 
 Authentication:
   - Google Sheets: service account credentials via GOOGLE_SERVICE_ACCOUNT_JSON env var
   - GHL API: token via GHL_TOKEN env var
+  - Stripe: STRIPE_API_KEY and STRIPE_WEBHOOK_SECRET env vars
 
 All sensitive values are read from environment variables — nothing is hardcoded.
 """
@@ -324,7 +333,155 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str):
     except Exception as e:
         logger.error(f"Failed to update cell {col_letter}{row_number}: {e}")
 
+def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
+    """Highlight an entire row in the Sales Calls tab with the specified RGB color."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot highlight row — Sheets service unavailable")
+        return
+    try:
+        # Get the sheet ID for the "Sales Calls" tab
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = sheet_metadata.get('sheets', '')
+        sheet_id = None
+        for s in sheets:
+            if s.get("properties", {}).get("title") == "Sales Calls":
+                sheet_id = s.get("properties", {}).get("sheetId")
+                break
+                
+        if sheet_id is None:
+            logger.error("Could not find sheet ID for 'Sales Calls' tab")
+            return
+
+        # 0-based index for the API
+        row_index = row_number - 1
+        
+        request = {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": row_index,
+                    "endRowIndex": row_index + 1
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": red,
+                            "green": green,
+                            "blue": blue
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor"
+            }
+        }
+        
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [request]}
+        ).execute()
+        logger.info(f"Row {row_number} highlighted successfully")
+    except Exception as e:
+        logger.error(f"Failed to highlight row {row_number}: {e}")
+
 # ─── Event Handlers ───────────────────────────────────────────
+
+def handle_opportunity_won(body: dict):
+    """Handle an opportunity stage change to 'Won (Closed)'."""
+    email = extract_field(body, "email")
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+    
+    if not email and contact_id:
+        logger.info(f"Email not in payload — fetching from GHL API for contact {contact_id}")
+        contact = ghl_get_contact(contact_id)
+        email = contact.get("email", "").strip()
+        
+    if not email:
+        logger.warning("No email found for opportunity won event — cannot locate row")
+        return
+        
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update Closed status")
+        return
+        
+    # 1. Mark column H as "Closed"
+    sheets_update_cell(existing_row, "H", "Closed")
+    logger.info(f"Updated Closed status for {email} at row {existing_row}")
+    
+    # 2. Look up Stripe data
+    if not STRIPE_API_KEY:
+        logger.warning("STRIPE_API_KEY not set — skipping Stripe lookup, highlighting row yellow")
+        sheets_highlight_row(existing_row, 1.0, 1.0, 0.0) # Yellow
+        return
+        
+    try:
+        # Search for customer by email
+        customers = stripe.Customer.search(query=f"email:'{email}'", limit=1)
+        if not customers.data:
+            logger.info(f"No Stripe customer found for {email} — highlighting row yellow")
+            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0) # Yellow
+            return
+            
+        customer_id = customers.data[0].id
+        
+        # Look for active subscriptions first
+        subs = stripe.Subscription.list(customer=customer_id, status='active', limit=1)
+        
+        amount_aud = 0.0
+        num_payments = 1
+        contracted_revenue_aud = 0.0
+        found_data = False
+        
+        if subs.data:
+            sub = subs.data[0]
+            currency = sub.currency
+            exchange_rate = get_exchange_rate(currency, "AUD")
+            
+            # Get subscription details using our helper
+            payments, total_rev = get_stripe_subscription_details(sub.id)
+            
+            # Calculate initial payment (first cycle amount)
+            initial_amount = 0.0
+            for item in sub.get('items', {}).get('data', []):
+                price = item.get('price', {})
+                quantity = item.get('quantity', 1)
+                unit_amount = price.get('unit_amount', 0) / 100.0
+                initial_amount += unit_amount * quantity
+                
+            amount_aud = initial_amount * exchange_rate
+            num_payments = payments
+            contracted_revenue_aud = total_rev * exchange_rate
+            found_data = True
+            logger.info(f"Found active subscription for {email}")
+            
+        else:
+            # If no active subscription, look for recent successful charges
+            charges = stripe.Charge.list(customer=customer_id, limit=10)
+            for charge in charges.data:
+                if charge.status == 'succeeded' and charge.paid:
+                    currency = charge.currency
+                    exchange_rate = get_exchange_rate(currency, "AUD")
+                    amount_aud = (charge.amount / 100.0) * exchange_rate
+                    num_payments = 1
+                    contracted_revenue_aud = amount_aud
+                    found_data = True
+                    logger.info(f"Found recent successful charge for {email}")
+                    break
+                    
+        if found_data:
+            # Update columns I, J, K
+            sheets_update_cell(existing_row, "I", f"{amount_aud:.2f}")
+            sheets_update_cell(existing_row, "J", str(num_payments))
+            sheets_update_cell(existing_row, "K", f"{contracted_revenue_aud:.2f}")
+            logger.info(f"Updated financial data for {email} from Stripe lookup")
+        else:
+            logger.info(f"No active subscriptions or successful charges found for {email} — highlighting row yellow")
+            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0) # Yellow
+            
+    except Exception as e:
+        logger.error(f"Error during Stripe lookup for {email}: {e}")
+        sheets_highlight_row(existing_row, 1.0, 1.0, 0.0) # Yellow
 
 def handle_appointment_created(body: dict):
     """Handle a new appointment booking — add or update a row."""
@@ -754,12 +911,27 @@ async def webhook(request: Request):
         "status", "showed", "no_show", "noshow", "cancelled",
     ):
         handle_appointment_status(body)
+        
+    elif event_type in ("opportunity_stage_update", "opportunity.stage_update", "pipeline_stage_update"):
+        stage_name = extract_field(body, "pipeline_stage", "stage_name", "opportunity_stage", "stageName").lower()
+        pipeline_name = extract_field(body, "pipeline_name", "pipelineName").lower()
+        
+        if "won" in stage_name or "closed" in stage_name:
+            handle_opportunity_won(body)
+        else:
+            logger.info(f"Ignoring opportunity stage update: {stage_name}")
 
     else:
         # Infer from payload content when no explicit type field
         status_val = extract_field(
             body, "status", "appointmentStatus", "appointment_status",
         ).lower()
+        
+        # Check for opportunity stage change implicitly
+        stage_name = extract_field(body, "pipeline_stage", "stage_name", "opportunity_stage", "stageName").lower()
+        if stage_name and ("won" in stage_name or "closed" in stage_name):
+            handle_opportunity_won(body)
+            return JSONResponse(content={"status": "ok"}, status_code=200)
         # Also check GHL calendar object for status
         cal_status = (body.get("calendar", {}) or {}).get("appoinmentStatus", "").lower()
         effective_status = status_val or cal_status
@@ -794,7 +966,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
