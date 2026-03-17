@@ -433,13 +433,15 @@ def handle_opportunity_won(body: dict):
         contracted_revenue_aud = 0.0
         found_data = False
         
+        is_primary = True  # assume primary until we know otherwise
+        
         if subs.data:
             sub = subs.data[0]
             currency = sub.currency
             exchange_rate = get_exchange_rate(currency, "AUD")
             
-            # Get subscription details using our helper
-            payments, total_rev = get_stripe_subscription_details(sub.id)
+            # Get subscription details using our helper (returns 3-tuple)
+            payments, total_rev, is_primary = get_stripe_subscription_details(sub.id)
             
             # Calculate initial payment (first cycle amount)
             initial_amount = 0.0
@@ -453,10 +455,12 @@ def handle_opportunity_won(body: dict):
             num_payments = payments
             contracted_revenue_aud = total_rev * exchange_rate
             found_data = True
-            logger.info(f"Found active subscription for {email}")
+            logger.info(f"Found active subscription for {email} (primary_strategy={is_primary})")
             
         else:
-            # If no active subscription, look for recent successful charges
+            # If no active subscription, look for recent successful charges.
+            # Charges are always a fallback — no schedule data available.
+            is_primary = False
             charges = stripe.Charge.list(customer=customer_id, limit=10)
             for charge in charges.data:
                 if charge.status == 'succeeded' and charge.paid:
@@ -466,7 +470,7 @@ def handle_opportunity_won(body: dict):
                     num_payments = 1
                     contracted_revenue_aud = amount_aud
                     found_data = True
-                    logger.info(f"Found recent successful charge for {email}")
+                    logger.info(f"Found recent successful charge for {email} [fallback]")
                     break
                     
         if found_data:
@@ -475,9 +479,14 @@ def handle_opportunity_won(body: dict):
             sheets_update_cell(existing_row, "J", str(num_payments))
             sheets_update_cell(existing_row, "K", f"{contracted_revenue_aud:.2f}")
             logger.info(f"Updated financial data for {email} from Stripe lookup")
+            # Highlight light orange if a fallback strategy was used, so the team
+            # knows to manually verify the contracted revenue figure.
+            if not is_primary:
+                logger.info(f"Fallback strategy used for {email} — highlighting row orange")
+                sheets_highlight_row(existing_row, 1.0, 200/255, 100/255)  # Light orange
         else:
             logger.info(f"No active subscriptions or successful charges found for {email} — highlighting row yellow")
-            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0) # Yellow
+            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)  # Yellow
             
     except Exception as e:
         logger.error(f"Error during Stripe lookup for {email}: {e}")
@@ -657,23 +666,25 @@ def get_exchange_rate(from_currency: str, to_currency: str = "AUD") -> float:
 def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
     """
     Fetch subscription details from Stripe.
-    Returns (number_of_payments, total_contracted_revenue_in_original_currency).
+    Returns (number_of_payments, total_contracted_revenue_in_original_currency, is_primary_strategy).
+
+    is_primary_strategy is True only when Strategy 0 (tc_fixed_rebills) was used.
+    Callers should highlight the row light orange when is_primary_strategy is False,
+    so the team knows the figure needs manual verification.
 
     Strategy priority order:
-    0. ThriveCart metadata 'tc_fixed_rebills':
+    0. ThriveCart metadata 'tc_fixed_rebills'  → is_primary_strategy=True
          total_payments = int(tc_fixed_rebills) + 1  (rebills after initial payment)
-    1. SubscriptionSchedule phases (iterations sum)
-    2. Generic metadata field 'total_payments'
-    3. cancel_at vs billing_cycle_anchor date-range estimate
-    4. ThriveCart product name parsing:
-         pattern: thrivecart-{id}-{price_cents}-{interval}-aud{rebills}rebills
-         amount overridden from name if Stripe price differs (e.g. $0 trial)
-    5. Default: 1 payment at the Stripe per-cycle amount
+    1. SubscriptionSchedule phases (iterations sum)  → is_primary_strategy=False
+    2. Generic metadata field 'total_payments'        → is_primary_strategy=False
+    3. cancel_at vs billing_cycle_anchor estimate     → is_primary_strategy=False
+    4. ThriveCart product name parsing                → is_primary_strategy=False
+    5. Default: 1 payment at the Stripe per-cycle amount → is_primary_strategy=False
     """
     import re as _re
 
     if not STRIPE_API_KEY or not subscription_id:
-        return 1, 0.0
+        return 1, 0.0, False
     try:
         sub = stripe.Subscription.retrieve(
             subscription_id,
@@ -699,9 +710,9 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
                 total_amount = per_cycle_amount * num_payments
                 logger.info(
                     f"Subscription {subscription_id}: {num_payments} payments "
-                    f"via tc_fixed_rebills={tc_rebills}"
+                    f"via tc_fixed_rebills={tc_rebills} [primary strategy]"
                 )
-                return num_payments, total_amount
+                return num_payments, total_amount, True  # is_primary_strategy=True
             except (ValueError, TypeError):
                 logger.warning(
                     f"Subscription {subscription_id}: could not parse "
@@ -721,9 +732,9 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
                 num_payments = total_iterations
                 total_amount = per_cycle_amount * num_payments
                 logger.info(
-                    f"Subscription {subscription_id}: {num_payments} payments via schedule"
+                    f"Subscription {subscription_id}: {num_payments} payments via schedule [fallback]"
                 )
-                return num_payments, total_amount
+                return num_payments, total_amount, False  # is_primary_strategy=False
 
         # --- Strategy 2: generic metadata['total_payments'] ---
         meta_total = metadata.get('total_payments')
@@ -732,9 +743,9 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
                 num_payments = int(meta_total)
                 total_amount = per_cycle_amount * num_payments
                 logger.info(
-                    f"Subscription {subscription_id}: {num_payments} payments via metadata"
+                    f"Subscription {subscription_id}: {num_payments} payments via metadata [fallback]"
                 )
-                return num_payments, total_amount
+                return num_payments, total_amount, False  # is_primary_strategy=False
             except (ValueError, TypeError):
                 pass
 
@@ -763,9 +774,9 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
             num_payments = max(1, round(cycles))
             total_amount = per_cycle_amount * num_payments
             logger.info(
-                f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate"
+                f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate [fallback]"
             )
-            return num_payments, total_amount
+            return num_payments, total_amount, False  # is_primary_strategy=False
 
         # --- Strategy 4: ThriveCart product name parsing ---
         # Pattern: thrivecart-{product_id}-{price_id}-{amount_cents}-{interval}-aud{rebills}rebills
@@ -803,21 +814,21 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple[int, float]:
                 total_amount = effective_amount * num_payments
                 logger.info(
                     f"Subscription {subscription_id}: {num_payments} payments via "
-                    f"ThriveCart product name (amount={effective_amount})"
+                    f"ThriveCart product name (amount={effective_amount}) [fallback]"
                 )
-                return num_payments, total_amount
+                return num_payments, total_amount, False  # is_primary_strategy=False
             except (ValueError, TypeError) as e:
                 logger.warning(
                     f"Subscription {subscription_id}: ThriveCart name parse failed: {e}"
                 )
 
         # --- Strategy 5: default — single payment ---
-        logger.info(f"Subscription {subscription_id}: defaulting to 1 payment")
-        return 1, per_cycle_amount
+        logger.info(f"Subscription {subscription_id}: defaulting to 1 payment [fallback]")
+        return 1, per_cycle_amount, False  # is_primary_strategy=False
 
     except Exception as e:
         logger.error(f"Failed to fetch Stripe subscription {subscription_id}: {e}")
-        return 1, 0.0
+        return 1, 0.0, False
 
 def handle_stripe_payment(event: dict):
     """Process a successful Stripe payment."""
@@ -864,12 +875,13 @@ def handle_stripe_payment(event: dict):
     num_payments = 1
     contracted_revenue_aud = amount_aud
     
+    is_primary = True  # default: no subscription means single charge, no fallback needed
     if subscription_id:
-        payments, total_rev = get_stripe_subscription_details(subscription_id)
+        payments, total_rev, is_primary = get_stripe_subscription_details(subscription_id)
         num_payments = payments
         contracted_revenue_aud = total_rev * exchange_rate
 
-    logger.info(f"Stripe Payment: {customer_email}, Amount: {amount_aud} AUD, Payments: {num_payments}, Rev: {contracted_revenue_aud} AUD")
+    logger.info(f"Stripe Payment: {customer_email}, Amount: {amount_aud} AUD, Payments: {num_payments}, Rev: {contracted_revenue_aud} AUD, primary_strategy={is_primary}")
 
     # Find row in Google Sheet
     row_num = find_row_by_email(customer_email)
@@ -880,6 +892,10 @@ def handle_stripe_payment(event: dict):
         sheets_update_cell(row_num, "J", str(num_payments))
         sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
         logger.info(f"Updated Stripe payment for {customer_email} at row {row_num}")
+        # Highlight light orange when a fallback strategy determined the contracted revenue
+        if subscription_id and not is_primary:
+            logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
+            sheets_highlight_row(row_num, 1.0, 200/255, 100/255)  # Light orange
     else:
         # Append to Unmatched Payments tab
         logger.info(f"No matching row for {customer_email}. Appending to Unmatched Payments.")
@@ -1064,7 +1080,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.4.2",
+        "version": "1.4.3",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
