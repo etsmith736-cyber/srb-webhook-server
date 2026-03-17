@@ -913,7 +913,7 @@ async def webhook(request: Request):
         handle_appointment_status(body)
         
     elif event_type in ("opportunity_stage_update", "opportunity.stage_update", "pipeline_stage_update"):
-        stage_name = extract_field(body, "pipeline_stage", "stage_name", "opportunity_stage", "stageName").lower()
+        stage_name = extract_field(body, "pipleline_stage", "pipeline_stage", "stage_name", "opportunity_stage", "stageName").lower()
         pipeline_name = extract_field(body, "pipeline_name", "pipelineName").lower()
         
         if "won" in stage_name or "closed" in stage_name:
@@ -923,16 +923,40 @@ async def webhook(request: Request):
 
     else:
         # Infer from payload content when no explicit type field
+        
+        # --- Pipeline / opportunity detection (must run BEFORE appointment fallback) ---
+        # Check all known stage-name fields, including the GHL typo "pipleline_stage"
+        stage_name = extract_field(
+            body,
+            "pipleline_stage",   # GHL typo — primary field in live payloads
+            "pipeline_stage",    # correct spelling (future-proofing)
+            "stage_name",
+            "opportunity_stage",
+            "stageName",
+        ).lower()
+        
+        # Treat the payload as a pipeline event if any of these pipeline-specific
+        # fields are present — even if stage_name is empty or not Won/Closed.
+        is_pipeline_event = bool(
+            stage_name
+            or body.get("pipeline_name")
+            or body.get("pipelineName")
+            or body.get("opportunity_name")
+            or body.get("opportunityName")
+        )
+        
+        if is_pipeline_event:
+            if "won" in stage_name or "closed" in stage_name:
+                logger.info(f"Implicit pipeline Won/Closed detected: stage='{stage_name}'")
+                handle_opportunity_won(body)
+            else:
+                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed)")
+            return JSONResponse(content={"status": "ok"}, status_code=200)
+        
+        # --- Appointment status / created fallback (only reached for non-pipeline payloads) ---
         status_val = extract_field(
             body, "status", "appointmentStatus", "appointment_status",
         ).lower()
-        
-        # Check for opportunity stage change implicitly
-        stage_name = extract_field(body, "pipeline_stage", "stage_name", "opportunity_stage", "stageName").lower()
-        if stage_name and ("won" in stage_name or "closed" in stage_name):
-            handle_opportunity_won(body)
-            return JSONResponse(content={"status": "ok"}, status_code=200)
-        # Also check GHL calendar object for status
         cal_status = (body.get("calendar", {}) or {}).get("appoinmentStatus", "").lower()
         effective_status = status_val or cal_status
 
@@ -966,7 +990,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.4.0",
+        "version": "1.4.1",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
