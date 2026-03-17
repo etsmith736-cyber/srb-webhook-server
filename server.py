@@ -425,8 +425,16 @@ def handle_opportunity_won(body: dict):
             
         customer_id = customers.data[0].id
         
-        # Look for active subscriptions first
-        subs = stripe.Subscription.list(customer=customer_id, status='active', limit=1)
+        # Query without a status filter to include both active AND trialing subscriptions.
+        # ThriveCart creates subscriptions with status=trialing (trial period delays first rebill).
+        # Stripe returns subscriptions ordered by creation date desc; we pick the most recent
+        # one that is not cancelled or incomplete_expired.
+        CANCELLED_STATUSES = {'canceled', 'incomplete_expired'}
+        subs = stripe.Subscription.list(customer=customer_id, limit=5)
+        best_sub = next(
+            (s for s in subs.data if s.get('status') not in CANCELLED_STATUSES),
+            None,
+        )
         
         amount_aud = 0.0
         num_payments = 1
@@ -435,8 +443,8 @@ def handle_opportunity_won(body: dict):
         
         is_primary = True  # assume primary until we know otherwise
         
-        if subs.data:
-            sub = subs.data[0]
+        if best_sub:
+            sub = best_sub
             currency = sub.currency
             exchange_rate = get_exchange_rate(currency, "AUD")
             
@@ -455,10 +463,10 @@ def handle_opportunity_won(body: dict):
             num_payments = payments
             contracted_revenue_aud = total_rev * exchange_rate
             found_data = True
-            logger.info(f"Found active subscription for {email} (primary_strategy={is_primary})")
+            logger.info(f"Found subscription (status={sub.get('status')}) for {email} (primary_strategy={is_primary})")
             
         else:
-            # If no active subscription, look for recent successful charges.
+            # No active/trialing subscription found — fall back to recent successful charges.
             # Charges are always a fallback — no schedule data available.
             is_primary = False
             charges = stripe.Charge.list(customer=customer_id, limit=10)
@@ -1080,7 +1088,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.4.3",
+        "version": "1.4.4",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
