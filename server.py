@@ -229,7 +229,7 @@ def sheets_append_row(values: list[str]):
                 "--params", json.dumps({
                     "spreadsheetId": SPREADSHEET_ID,
                     "range": f"'{SHEET_TAB}'!A:Q",
-                    "valueInputOption": "USER_ENTERED",
+                    "valueInputOption": "RAW",
                     "insertDataOption": "INSERT_ROWS",
                 }),
                 "--json", payload,
@@ -254,7 +254,7 @@ def sheets_update_row(row_number: int, values: list[str]):
                 "--params", json.dumps({
                     "spreadsheetId": SPREADSHEET_ID,
                     "range": f"'{SHEET_TAB}'!A{row_number}:Q{row_number}",
-                    "valueInputOption": "USER_ENTERED",
+                    "valueInputOption": "RAW",
                 }),
                 "--json", payload,
             ],
@@ -278,7 +278,7 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str):
                 "--params", json.dumps({
                     "spreadsheetId": SPREADSHEET_ID,
                     "range": f"'{SHEET_TAB}'!{col_letter}{row_number}",
-                    "valueInputOption": "USER_ENTERED",
+                    "valueInputOption": "RAW",
                 }),
                 "--json", payload,
             ],
