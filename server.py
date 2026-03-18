@@ -328,8 +328,11 @@ def handle_appointment_created(payload: dict):
     date_booked = now_aest.strftime("%Y-%m-%d %H:%M AEST")
 
     # Date of Call = appointment start time
+    # Also check calendar nested object (GHL workflow sends startTime inside calendar{})
+    calendar_data = payload.get("calendar", {})
     start_time_str = (
-        appointment.get("startTime")
+        calendar_data.get("startTime")
+        or appointment.get("startTime")
         or appointment.get("start_time")
         or payload.get("startTime")
         or payload.get("start_time")
@@ -354,15 +357,28 @@ def handle_appointment_created(payload: dict):
     # Stage
     utm_stage = get_custom_field(contact, CF_UTM_STAGE)
 
-    # Sales Rep
-    assigned_user_id = (
-        appointment.get("assignedUserId")
-        or appointment.get("assigned_user_id")
-        or payload.get("assignedUserId")
-        or payload.get("assigned_user_id")
-        or ""
-    )
-    sales_rep = USER_MAP.get(assigned_user_id, "")
+    # Sales Rep — try multiple sources
+    sales_rep = ""
+
+    # 1. Try calendar title: "Roadmap Call: Contact Name and Sales Rep Name"
+    calendar_obj = payload.get("calendar", {})
+    cal_title = calendar_obj.get("title", "")
+    if cal_title and " and " in cal_title:
+        # Title format: "Roadmap Call: Contact Name and Sales Rep Name"
+        after_and = cal_title.split(" and ")[-1].strip()
+        if after_and:
+            sales_rep = after_and
+
+    # 2. Fall back to assignedUserId lookup
+    if not sales_rep:
+        assigned_user_id = (
+            appointment.get("assignedUserId")
+            or appointment.get("assigned_user_id")
+            or payload.get("assignedUserId")
+            or payload.get("assigned_user_id")
+            or ""
+        )
+        sales_rep = USER_MAP.get(assigned_user_id, "")
 
     # Build the row (17 columns: A through Q)
     row = [
