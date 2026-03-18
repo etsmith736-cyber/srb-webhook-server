@@ -553,7 +553,25 @@ def handle_appointment_created(body: dict):
     if start_time_str:
         try:
             dt = datetime.fromisoformat(str(start_time_str).replace("Z", "+00:00"))
-            date_of_call = dt.astimezone(AEST).strftime("%Y-%m-%d")
+            if dt.tzinfo is None:
+                # Naive datetime — GHL sent the time without a timezone offset.
+                # Use selectedTimezone from the calendar object if present;
+                # otherwise default to Australia/Brisbane (UTC+10), NOT UTC.
+                tz_name = (
+                    calendar_obj.get("selectedTimezone")
+                    or body.get("selectedTimezone")
+                    or "Australia/Brisbane"
+                )
+                try:
+                    import zoneinfo
+                    local_tz = zoneinfo.ZoneInfo(tz_name)
+                except Exception:
+                    import pytz
+                    local_tz = pytz.timezone(tz_name)
+                dt = dt.replace(tzinfo=local_tz)
+                logger.info(f"Naive startTime interpreted as {tz_name}: {dt}")
+            # Extract the date in the appointment's own timezone — no further conversion needed.
+            date_of_call = dt.strftime("%Y-%m-%d")
         except Exception:
             # If it's a human-readable string like "Wednesday, 18 March 2026 5:30 PM", keep as-is
             date_of_call = str(start_time_str)[:20] if start_time_str else ""
@@ -1088,7 +1106,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.4.4",
+        "version": "1.4.5",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "health_endpoint": "GET /health",
