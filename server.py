@@ -369,16 +369,17 @@ def handle_appointment_created(payload: dict):
         if after_and:
             sales_rep = after_and
 
-    # 2. Fall back to assignedUserId lookup
+    # 2. Fall back to assignedUserId / assigned_user lookup
     if not sales_rep:
         assigned_user_id = (
-            appointment.get("assignedUserId")
+            payload.get("assigned_user")          # GHL workflow custom field
+            or appointment.get("assignedUserId")
             or appointment.get("assigned_user_id")
             or payload.get("assignedUserId")
             or payload.get("assigned_user_id")
             or ""
         )
-        sales_rep = USER_MAP.get(assigned_user_id, "")
+        sales_rep = USER_MAP.get(assigned_user_id, assigned_user_id)  # fall back to raw value if not in map
 
     # Build the row (17 columns: A through Q)
     row = [
