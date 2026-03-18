@@ -340,11 +340,16 @@ def handle_appointment_created(payload: dict):
     )
     date_of_call = ""
     if start_time_str:
+        # GHL sends times in the calendar's timezone (AEST/Brisbane)
+        # Just clean the ISO string directly: "2026-03-24T16:00:00" -> "2026-03-24 16:00 AEST"
         try:
-            dt = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
-            date_of_call = dt.astimezone(AEST).strftime("%Y-%m-%d %H:%M AEST")
+            clean = start_time_str.replace("Z", "").split("+")[0]  # strip timezone suffix
+            parts = clean.split("T")
+            date_part = parts[0]  # "2026-03-24"
+            time_part = parts[1][:5] if len(parts) > 1 else ""  # "16:00"
+            date_of_call = f"{date_part} {time_part} AEST" if time_part else date_part
         except Exception:
-            date_of_call = start_time_str[:10] if len(start_time_str) >= 10 else ""
+            date_of_call = start_time_str
 
     # Lead Source
     lead_source = determine_lead_source(contact)
