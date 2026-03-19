@@ -92,6 +92,7 @@ COL = {
     "Stage": 14,
     "Sales Rep": 15,
     "Notes": 16,
+    "Date of Purchase": 17,
 }
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -465,9 +466,13 @@ def handle_appointment_status(payload: dict):
         logger.warning(f"No row found for {email} to update status")
         return
 
-    # Update only the Showed column (column G)
+    # Update Showed column (G) always
     sheets_update_cell(existing_row, "G", showed_value)
     logger.info(f"Updated Showed to '{showed_value}' for {email} at row {existing_row}")
+    # For Cancelled and No-Show, also update Closed column (H)
+    if showed_value in ("Cancelled", "No-Show"):
+        sheets_update_cell(existing_row, "H", showed_value)
+        logger.info(f"Updated Closed to '{showed_value}' for {email} at row {existing_row}")
 
 
 # ─── Webhook Endpoint ────────────────────────────────────────
