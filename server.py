@@ -102,7 +102,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/home/ubuntu/webhook-server/webhook.log"),
     ],
 )
 logger = logging.getLogger("webhook")
