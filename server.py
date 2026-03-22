@@ -478,6 +478,28 @@ def handle_appointment_status(payload: dict):
         logger.info(f"Updated Closed to 'Maybe' for {email} at row {existing_row}")
 
 
+def handle_pipeline_lost(payload: dict):
+    """Handle pipeline stage moved to Lost — update Closed column to No."""
+    contact_id = payload.get("contact_id") or payload.get("contactId") or ""
+    if not contact_id:
+        logger.warning("No contact_id in pipeline_lost payload")
+        return
+
+    contact = ghl_get_contact(contact_id)
+    email = contact.get("email", "").strip()
+    if not email:
+        logger.warning(f"Contact {contact_id} has no email, cannot find row")
+        return
+
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} to update pipeline stage")
+        return
+
+    sheets_update_cell(existing_row, "H", "No")
+    logger.info(f"Updated Closed to 'No' for {email} at row {existing_row}")
+
+
 # ─── Webhook Endpoint ────────────────────────────────────────
 
 @app.post("/webhook")
@@ -507,6 +529,8 @@ async def webhook(request: Request):
     elif event_type in ("appointment_status", "appointment.status", "status_update",
                         "status", "showed", "no_show", "noshow", "cancelled"):
         handle_appointment_status(body)
+    elif event_type in ("pipeline_lost", "opportunity_lost", "lost"):
+        handle_pipeline_lost(body)
     else:
         # If no explicit type, try to infer from payload content
         if body.get("appointmentStatus") or body.get("status"):
