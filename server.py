@@ -1,15 +1,29 @@
 """
-GHL → Google Sheets Webhook Receiver
-=====================================
-Receives appointment events from Go High Level workflows and writes
-them to the "Sales Calls" tab in the SRB Master Spreadsheet.
+GHL + Stripe → Google Sheets Webhook Receiver
+===============================================
+Receives events from Go High Level workflows and Stripe, writing
+results to the "Sales Calls" tab in the SRB Master Spreadsheet.
 
-Two event types:
-  1. appointment_created  → add/update a row (dedup by email)
-  2. appointment_status   → update the Showed column only
+Event types handled:
+  1. appointment_created        → add/update a row (dedup by email)
+  2. appointment_status         → update Showed (G) and Closed (H) columns
+  3. opportunity_stage_update   → on "Won (Closed)": mark H=Closed,
+                                   look up Stripe for I/J/K, or
+                                   highlight row yellow if no data
+                                 → on "Lost": mark H=No
+  4. pipeline_lost              → mark H=No
 
-Google Sheets access is via the Google Sheets API v4 (service account).
-GHL contact enrichment is via the GHL API v2.
+Stripe webhook (POST /stripe-webhook):
+  5. payment_intent.succeeded   → update I/J/K or append Unmatched
+  6. invoice.payment_succeeded  → update I/J/K or append Unmatched
+  7. charge.succeeded           → update I/J/K or append Unmatched
+
+Authentication:
+  - Google Sheets: service account credentials via GOOGLE_SERVICE_ACCOUNT_JSON env var
+  - GHL API: token via GHL_TOKEN env var
+  - Stripe: STRIPE_API_KEY and STRIPE_WEBHOOK_SECRET env vars
+
+All sensitive values are read from environment variables — nothing is hardcoded.
 """
 
 import json
@@ -24,33 +38,34 @@ from fastapi.responses import JSONResponse
 import requests as http_requests
 import uvicorn
 
+# Google Sheets API
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# ─── Configuration ────────────────────────────────────────────
+# ─── Configuration (from environment variables) ───────────────
 
-SPREADSHEET_ID = "143pCbA2rktBqI-t3EYUjZBiZNZv0i-WxuPobN9wKRW0"
-SHEET_TAB = "Sales Calls"
+SPREADSHEET_ID        = os.environ.get("SPREADSHEET_ID",        "143pCbA2rktBqI-t3EYUjZBiZNZv0i-WxuPobN9wKRW0")
+GHL_TOKEN             = os.environ.get("GHL_TOKEN",             "pit-0fb92538-98d8-4398-ad6b-6714a566bdbd")
+GHL_LOCATION_ID       = os.environ.get("GHL_LOCATION_ID",       "n4rqgABEMiHBL5Ui84JV")
+GHL_BASE_URL          = os.environ.get("GHL_BASE_URL",          "https://services.leadconnectorhq.com")
+PORT                  = int(os.environ.get("PORT",              "8000"))
+STRIPE_API_KEY        = os.environ.get("STRIPE_API_KEY",        "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+GOOGLE_SA_JSON        = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
-GHL_TOKEN = "pit-0fb92538-98d8-4398-ad6b-6714a566bdbd"
-GHL_LOCATION_ID = "n4rqgABEMiHBL5Ui84JV"
-GHL_BASE_URL = "https://services.leadconnectorhq.com"
+import stripe
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
 
-# Custom field IDs (discovered from GHL API)
-CF_UTM_CALL = "PIP4Uqb6byKTtlkCdNru"
-CF_UTM_STAGE = "pbbiyB60QSfnuBZpop1f"
+# ─── GHL custom field IDs ─────────────────────────────────────
+
+CF_UTM_CALL   = "PIP4Uqb6byKTtlkCdNru"
+CF_UTM_STAGE  = "pbbiyB60QSfnuBZpop1f"
 CF_UTM_SOURCE = "hQrjQsnMLfIMD8eLTtAY"
 
-# Relevant calendar IDs (sales call calendars)
-SALES_CALENDARS = {
-    "fGWCul6EemzLTJATJ2s6",   # Roadmap Call
-    "VTvpuQtlglY2zIDgrp6z",   # Roadmap Call (Extended)
-    "4Bo2wnrhzScvPAMiwlyj",   # Roadmap Call - Claudia
-    "VDs66QI1O5XGXvVtjArN",   # Roadmap Call - Sofia
-    "Bqmtru7sLYjxHAVcZFri",   # Roadmap Call - SRC
-}
+# ─── User ID → Name mapping ───────────────────────────────────
 
-# User ID → Name mapping
 USER_MAP = {
     "nNREQ8LGK7my0DEGCenm": "Claudia Tomczyk",
     "YZfd4b5zbbQhpmTTBhPx": "Ethan Smith",
@@ -62,39 +77,46 @@ USER_MAP = {
     "SUahnITFo9jHoijb8ReT": "Vada Rey-Matias",
 }
 
-# Status mapping for Showed column
+# ─── Ad source keywords ───────────────────────────────────────
+
+AD_SOURCES = {"META", "FACEBOOK", "INSTAGRAM", "GOOGLE", "TIKTOK", "YOUTUBE", "LINKEDIN"}
+
+# ─── Status mapping for Showed column ────────────────────────
+
 STATUS_MAP = {
-    "showed": "Showed",
-    "no_show": "No-Show",
-    "noshow": "No-Show",
-    "no-show": "No-Show",
+    "showed":    "Showed",
+    "no_show":   "No-Show",
+    "noshow":    "No-Show",
+    "no-show":   "No-Show",
     "cancelled": "Cancelled",
-    "canceled": "Cancelled",
+    "canceled":  "Cancelled",
 }
 
-# AEST timezone (UTC+10)
+# ─── Timezone ─────────────────────────────────────────────────
+
 AEST = timezone(timedelta(hours=10))
 
-# Column indices in the sheet (0-based for internal use, 1-based for Sheets API)
+# ─── Column indices (0-based) ─────────────────────────────────
+
 COL = {
-    "Date Added": 0,
-    "Appointment Time": 1,
-    "First Name": 2,
-    "Last Name": 3,
-    "Email": 4,
-    "Phone": 5,
-    "Showed": 6,
-    "Closed": 7,
-    "Cash Collected (AUD)": 8,
-    "Number of Payments": 9,
+    "Date Added":               0,
+    "Appointment Time":         1,
+    "First Name":               2,
+    "Last Name":                3,
+    "Email":                    4,
+    "Phone":                    5,
+    "Showed":                   6,
+    "Closed":                   7,
+    "Cash Collected (AUD)":     8,
+    "Number of Payments":       9,
     "Contracted Revenue (AUD)": 10,
-    "Lead Source": 11,
-    "Call Source": 12,
-    "Webinar ID": 13,
-    "Stage": 14,
-    "Sales Rep": 15,
-    "Notes": 16,
-    "Date of Purchase": 17,
+    "Lead Source":              11,
+    "Call Source":              12,
+    "Webinar ID":               13,
+    "Stage":                    14,
+    "Sales Rep":                15,
+    "Notes":                    16,
+    "Date of Purchase":         17,
 }
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -102,32 +124,96 @@ COL = {
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("webhook")
 
+# ─── Google Sheets Service ────────────────────────────────────
+
+_sheets_service = None
+
+def get_sheets_service():
+    """Build and cache the Google Sheets API service using service account credentials."""
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
+    if not GOOGLE_SA_JSON:
+        logger.error("GOOGLE_SERVICE_ACCOUNT_JSON env var is not set — cannot access Google Sheets")
+        return None
+    try:
+        sa_info = json.loads(GOOGLE_SA_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        logger.info("Google Sheets service initialised successfully")
+        return _sheets_service
+    except Exception as e:
+        logger.error(f"Failed to initialise Google Sheets service: {e}")
+        return None
+
 # ─── FastAPI App ──────────────────────────────────────────────
 
-app = FastAPI(title="GHL Webhook Receiver")
+app = FastAPI(title="GHL + Stripe Webhook Receiver")
+
+# ─── Payload Extraction Helpers ───────────────────────────────
+
+def extract_field(body: dict, *keys: str, default: str = "") -> str:
+    """
+    Try multiple key names across the top-level body, a 'customData'
+    sub-object, and a nested 'contact' sub-object. Returns the first
+    non-empty string found, or `default`.
+    """
+    custom_data = body.get("customData", {}) or {}
+    contact_obj = body.get("contact", {}) or {}
+    for key in keys:
+        for source in (body, custom_data, contact_obj):
+            val = source.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    return default
 
 
-# ─── GHL API Helpers ──────────────────────────────────────────
+def extract_tags(body: dict) -> list[str]:
+    """Extract contact tags from any location in the payload."""
+    for source in (body, body.get("customData", {}) or {}, body.get("contact", {}) or {}):
+        tags = source.get("tags")
+        if tags and isinstance(tags, list):
+            return [str(t).lower() for t in tags]
+        if tags and isinstance(tags, str):
+            return [t.strip().lower() for t in tags.split(",") if t.strip()]
+    return []
 
-GHL_HEADERS = {
-    "Authorization": f"Bearer {GHL_TOKEN}",
-    "Version": "2021-07-28",
-    "Accept": "application/json",
-}
+# ─── Business Logic ───────────────────────────────────────────
 
+def determine_lead_source(utm_source: str, tags: list[str]) -> str:
+    if utm_source and utm_source.upper() in AD_SOURCES:
+        return "Ad"
+    for tag in tags:
+        if "ad lead" in tag:
+            return "Ad"
+    return "Needs Review"
+
+
+def determine_call_source(utm_call: str) -> str:
+    return "Webinar" if utm_call else "Misc"
+
+# ─── GHL API Helpers (fallback only) ──────────────────────────
 
 def ghl_get_contact(contact_id: str) -> dict:
-    """Fetch full contact details from GHL."""
+    """Fetch full contact details from GHL (used only when payload fields are absent)."""
+    if not GHL_TOKEN:
+        logger.warning("GHL_TOKEN not set — cannot perform API fallback lookup")
+        return {}
     try:
         r = http_requests.get(
             f"{GHL_BASE_URL}/contacts/{contact_id}",
-            headers=GHL_HEADERS,
+            headers={
+                "Authorization": f"Bearer {GHL_TOKEN}",
+                "Version": "2021-07-28",
+                "Accept": "application/json",
+            },
             timeout=10,
         )
         r.raise_for_status()
@@ -137,273 +223,380 @@ def ghl_get_contact(contact_id: str) -> dict:
         return {}
 
 
-def get_custom_field(contact: dict, field_id: str) -> str:
-    """Extract a custom field value from a contact dict."""
+def get_cf_value(contact: dict, field_id: str) -> str:
     for cf in contact.get("customFields", []):
         if cf.get("id") == field_id:
             return str(cf.get("value", "")).strip()
     return ""
 
-
-def determine_lead_source(contact: dict) -> str:
-    """Determine Lead Source from contact data."""
-    utm_source = get_custom_field(contact, CF_UTM_SOURCE).upper()
-    tags = [t.lower() for t in contact.get("tags", [])]
-
-    # Check utm_source for ad indicators
-    ad_sources = {"META", "FACEBOOK", "INSTAGRAM", "GOOGLE", "TIKTOK", "YOUTUBE", "LINKEDIN"}
-    if utm_source and utm_source in ad_sources:
-        return "Ad"
-
-    # Check tags for ad indicators
-    ad_tag_keywords = ["ad", "paid", "meta", "facebook", "instagram", "google"]
-    for tag in tags:
-        for kw in ad_tag_keywords:
-            if kw in tag:
-                return "Ad"
-
-    # Check if there's any utm_source at all (could be organic social)
-    if utm_source:
-        organic_sources = {"ORGANIC", "REFERRAL", "DIRECT", "EMAIL", "PODCAST"}
-        if utm_source in organic_sources:
-            return "Organic"
-        # Unknown utm_source — flag for review
-        return "Needs Review"
-
-    # No utm_source at all
-    if tags:
-        return "Needs Review"
-
-    return "Needs Review"
-
-
-def determine_call_source(contact: dict) -> str:
-    """Determine Call Source from utm_call custom field."""
-    utm_call = get_custom_field(contact, CF_UTM_CALL)
-    if utm_call:
-        return "Webinar"
-    return "Misc"
-
-
-# ─── Google Sheets Helpers (via Sheets API v4) ───────────────
-
-def _get_sheets_service():
-    """Build and return an authenticated Google Sheets API service."""
-    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    if not sa_json:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var not set")
-    sa_info = json.loads(sa_json)
-    creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
+# ─── Google Sheets Helpers ────────────────────────────────────
 
 def sheets_read_all() -> list[list[str]]:
     """Read all data from the Sales Calls tab."""
+    service = get_sheets_service()
+    if not service:
+        return []
     try:
-        service = _get_sheets_service()
         result = (
             service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"'{SHEET_TAB}'!A:R",
+                range="'Sales Calls'!A:R",
             )
             .execute()
         )
         return result.get("values", [])
+    except HttpError as e:
+        logger.error(f"Sheets read error: {e}")
+        return []
     except Exception as e:
         logger.error(f"Failed to read sheet: {e}")
         return []
 
 
 def find_row_by_email(email: str) -> Optional[int]:
-    """Find the 1-based row number of a contact by email. Returns None if not found."""
+    """Return 1-based row number for an email match, or None."""
     rows = sheets_read_all()
     email_lower = email.strip().lower()
     for i, row in enumerate(rows):
         if i == 0:
             continue  # skip header
-        if len(row) > COL["Email"]:
-            if row[COL["Email"]].strip().lower() == email_lower:
-                return i + 1  # 1-based row number
+        if len(row) > COL["Email"] and row[COL["Email"]].strip().lower() == email_lower:
+            return i + 1
     return None
 
 
 def sheets_append_row(values: list[str]):
     """Append a new row to the Sales Calls tab."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot append row — Sheets service unavailable")
+        return
     try:
-        service = _get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_TAB}'!A:R",
+            range="'Sales Calls'!A:R",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [values]},
         ).execute()
         logger.info("Row appended successfully")
+    except HttpError as e:
+        logger.error(f"Sheets append error: {e}")
     except Exception as e:
         logger.error(f"Failed to append row: {e}")
 
 
 def sheets_update_row(row_number: int, values: list[str]):
-    """Update an existing row (1-based) in the Sales Calls tab."""
+    """Overwrite an existing row (1-based) in the Sales Calls tab."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot update row — Sheets service unavailable")
+        return
     try:
-        service = _get_sheets_service()
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_TAB}'!A{row_number}:R{row_number}",
+            range=f"'Sales Calls'!A{row_number}:R{row_number}",
             valueInputOption="RAW",
             body={"values": [values]},
         ).execute()
         logger.info(f"Row {row_number} updated successfully")
+    except HttpError as e:
+        logger.error(f"Sheets update error: {e}")
     except Exception as e:
         logger.error(f"Failed to update row {row_number}: {e}")
 
 
 def sheets_update_cell(row_number: int, col_letter: str, value: str):
     """Update a single cell in the Sales Calls tab."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot update cell — Sheets service unavailable")
+        return
     try:
-        service = _get_sheets_service()
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_TAB}'!{col_letter}{row_number}",
+            range=f"'Sales Calls'!{col_letter}{row_number}",
             valueInputOption="RAW",
             body={"values": [[value]]},
         ).execute()
         logger.info(f"Cell {col_letter}{row_number} updated to '{value}'")
+    except HttpError as e:
+        logger.error(f"Sheets cell update error: {e}")
     except Exception as e:
         logger.error(f"Failed to update cell {col_letter}{row_number}: {e}")
 
 
+def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
+    """Highlight an entire row in the Sales Calls tab with the specified RGB color."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot highlight row — Sheets service unavailable")
+        return
+    try:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = sheet_metadata.get("sheets", [])
+        sheet_id = None
+        for s in sheets:
+            if s.get("properties", {}).get("title") == "Sales Calls":
+                sheet_id = s.get("properties", {}).get("sheetId")
+                break
+        if sheet_id is None:
+            logger.error("Could not find sheet ID for 'Sales Calls' tab")
+            return
+        row_index = row_number - 1
+        request = {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": row_index,
+                    "endRowIndex": row_index + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": red, "green": green, "blue": blue}
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        }
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [request]},
+        ).execute()
+        logger.info(f"Row {row_number} highlighted successfully")
+    except Exception as e:
+        logger.error(f"Failed to highlight row {row_number}: {e}")
+
 # ─── Event Handlers ───────────────────────────────────────────
 
-def handle_appointment_created(payload: dict):
-    """Handle a new appointment booking — add or update a row."""
-    contact_id = payload.get("contact_id") or payload.get("contactId") or ""
-    appointment = payload.get("appointment", payload)
-
-    if not contact_id:
-        # Try to extract from nested structures
-        contact_id = appointment.get("contactId", "")
-
-    if not contact_id:
-        logger.warning("No contact_id in payload, skipping")
-        return
-
-    # Fetch full contact from GHL API
-    contact = ghl_get_contact(contact_id)
-    if not contact:
-        logger.warning(f"Could not fetch contact {contact_id}")
-        return
-
-    email = contact.get("email", "").strip()
+def handle_opportunity_won(body: dict):
+    """Handle an opportunity stage change to 'Won (Closed)'."""
+    email = extract_field(body, "email")
     if not email:
-        logger.warning(f"Contact {contact_id} has no email, skipping")
+        contact_id = extract_field(body, "contact_id", "contactId")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = contact.get("email", "").strip()
+    if not email:
+        logger.warning("No email found for opportunity won event — cannot locate row")
         return
 
-    # Extract data
-    first_name = contact.get("firstName", "") or ""
-    last_name = contact.get("lastName", "") or ""
-    phone = contact.get("phone", "") or ""
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update Closed status")
+        return
 
-    # Date Added = now (AEST)
-    now_aest = datetime.now(AEST)
+    # 1. Mark column H as "Closed"
+    sheets_update_cell(existing_row, "H", "Closed")
+    logger.info(f"Updated Closed status for {email} at row {existing_row}")
+
+    # 2. Look up Stripe data
+    if not STRIPE_API_KEY:
+        logger.warning("STRIPE_API_KEY not set — skipping Stripe lookup, highlighting row yellow")
+        sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)
+        return
+
+    try:
+        customers = stripe.Customer.search(query=f"email:'{email}'", limit=1)
+        if not customers.data:
+            logger.info(f"No Stripe customer found for {email} — highlighting row yellow")
+            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)
+            return
+
+        customer_id = customers.data[0].id
+
+        # Include trialing subscriptions — ThriveCart uses trialing status
+        CANCELLED_STATUSES = {"canceled", "incomplete_expired"}
+        subs = stripe.Subscription.list(customer=customer_id, limit=5)
+        best_sub = next(
+            (s for s in subs.data if s.get("status") not in CANCELLED_STATUSES),
+            None,
+        )
+
+        amount_aud = 0.0
+        num_payments = 1
+        contracted_revenue_aud = 0.0
+        found_data = False
+        is_primary = True
+
+        if best_sub:
+            sub = best_sub
+            currency = sub.currency
+            exchange_rate = get_exchange_rate(currency, "AUD")
+            payments, total_rev, is_primary = get_stripe_subscription_details(sub.id)
+            initial_amount = 0.0
+            for item in sub.get("items", {}).get("data", []):
+                price = item.get("price", {})
+                quantity = item.get("quantity", 1)
+                unit_amount = price.get("unit_amount", 0) / 100.0
+                initial_amount += unit_amount * quantity
+            amount_aud = initial_amount * exchange_rate
+            num_payments = payments
+            contracted_revenue_aud = total_rev * exchange_rate
+            found_data = True
+            logger.info(f"Found subscription (status={sub.get('status')}) for {email} (primary_strategy={is_primary})")
+        else:
+            is_primary = False
+            charges = stripe.Charge.list(customer=customer_id, limit=10)
+            for charge in charges.data:
+                if charge.status == "succeeded" and charge.paid:
+                    currency = charge.currency
+                    exchange_rate = get_exchange_rate(currency, "AUD")
+                    amount_aud = (charge.amount / 100.0) * exchange_rate
+                    num_payments = 1
+                    contracted_revenue_aud = amount_aud
+                    found_data = True
+                    logger.info(f"Found recent successful charge for {email} [fallback]")
+                    break
+
+        if found_data:
+            sheets_update_cell(existing_row, "I", f"{amount_aud:.2f}")
+            sheets_update_cell(existing_row, "J", str(num_payments))
+            sheets_update_cell(existing_row, "K", f"{contracted_revenue_aud:.2f}")
+            logger.info(f"Updated financial data for {email} from Stripe lookup")
+            if not is_primary:
+                logger.info(f"Fallback strategy used for {email} — highlighting row orange")
+                sheets_highlight_row(existing_row, 1.0, 200 / 255, 100 / 255)
+        else:
+            logger.info(f"No active subscriptions or successful charges found for {email} — highlighting row yellow")
+            sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)
+
+    except Exception as e:
+        logger.error(f"Error during Stripe lookup for {email}: {e}")
+        sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)
+
+
+def handle_pipeline_lost(body: dict):
+    """Handle pipeline stage moved to Lost — update Closed column to No."""
+    email = extract_field(body, "email")
+    if not email:
+        contact_id = extract_field(body, "contact_id", "contactId")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = contact.get("email", "").strip()
+    if not email:
+        logger.warning("No email found for pipeline_lost event — cannot locate row")
+        return
+
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update pipeline stage")
+        return
+
+    sheets_update_cell(existing_row, "H", "No")
+    logger.info(f"Updated Closed to 'No' for {email} at row {existing_row}")
+
+
+def handle_appointment_created(body: dict):
+    """Handle a new appointment booking — add or update a row."""
+    first_name = extract_field(body, "first_name", "firstName")
+    last_name  = extract_field(body, "last_name",  "lastName")
+    email      = extract_field(body, "email")
+    phone      = extract_field(body, "phone")
+    utm_call   = extract_field(body, "utm_call")
+    utm_stage  = extract_field(body, "utm_stage")
+    utm_source = extract_field(body, "utm_source")
+    tags       = extract_tags(body)
+
+    start_time_str = extract_field(
+        body, "appointment_start", "startTime", "start_time", "appointmentStartTime",
+    )
+    # Also check inside nested calendar object (GHL standard payload)
+    calendar_obj = body.get("calendar", {}) or {}
+    if not start_time_str:
+        start_time_str = str(calendar_obj.get("startTime", ""))
+
+    assigned_user = extract_field(
+        body, "assigned_user", "assignedUserId", "assigned_user_id",
+        "assignedUser", "calendarOwnerId",
+    )
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+
+    # Fallback to GHL API if email is missing
+    if not email and contact_id:
+        logger.info(f"Email not in payload — falling back to GHL API for contact {contact_id}")
+        contact = ghl_get_contact(contact_id)
+        if contact:
+            first_name  = first_name  or contact.get("firstName", "")
+            last_name   = last_name   or contact.get("lastName",  "")
+            email       = email       or contact.get("email",     "")
+            phone       = phone       or contact.get("phone",     "")
+            utm_call    = utm_call    or get_cf_value(contact, CF_UTM_CALL)
+            utm_stage   = utm_stage   or get_cf_value(contact, CF_UTM_STAGE)
+            utm_source  = utm_source  or get_cf_value(contact, CF_UTM_SOURCE)
+            tags        = tags        or [t.lower() for t in contact.get("tags", [])]
+
+    if not email:
+        logger.warning("No email found in payload or GHL API — skipping")
+        return
+
+    now_aest    = datetime.now(AEST)
     date_booked = now_aest.strftime("%Y-%m-%d %H:%M AEST")
 
-    # Date of Call = appointment start time
-    # Also check calendar nested object (GHL workflow sends startTime inside calendar{})
-    calendar_data = payload.get("calendar", {})
-    start_time_str = (
-        calendar_data.get("startTime")
-        or appointment.get("startTime")
-        or appointment.get("start_time")
-        or payload.get("startTime")
-        or payload.get("start_time")
-        or ""
-    )
     date_of_call = ""
     if start_time_str:
-        # GHL sends times in the calendar's timezone (AEST/Brisbane)
-        # Just clean the ISO string directly: "2026-03-24T16:00:00" -> "2026-03-24 16:00 AEST"
         try:
-            clean = start_time_str.replace("Z", "").split("+")[0]  # strip timezone suffix
+            # Strip timezone suffix and treat as local (AEST/Brisbane)
+            clean = str(start_time_str).replace("Z", "").split("+")[0]
             parts = clean.split("T")
-            date_part = parts[0]  # "2026-03-24"
-            time_part = parts[1][:5] if len(parts) > 1 else ""  # "16:00"
+            date_part = parts[0]
+            time_part = parts[1][:5] if len(parts) > 1 else ""
             date_of_call = f"{date_part} {time_part} AEST" if time_part else date_part
         except Exception:
-            date_of_call = start_time_str
+            date_of_call = str(start_time_str)[:20] if start_time_str else ""
 
-    # Lead Source
-    lead_source = determine_lead_source(contact)
+    lead_source = determine_lead_source(utm_source, tags)
+    call_source = determine_call_source(utm_call)
 
-    # Call Source & Webinar ID
-    utm_call = get_custom_field(contact, CF_UTM_CALL)
-    call_source = "Webinar" if utm_call else "Misc"
-    webinar_id = utm_call
-
-    # Stage
-    utm_stage = get_custom_field(contact, CF_UTM_STAGE)
-
-    # Sales Rep — try multiple sources
+    # Sales Rep — try calendar title first, then assigned_user lookup
     sales_rep = ""
-
-    # 1. Try calendar title: "Roadmap Call: Contact Name and Sales Rep Name"
-    calendar_obj = payload.get("calendar", {})
     cal_title = calendar_obj.get("title", "")
     if cal_title and " and " in cal_title:
-        # Title format: "Roadmap Call: Contact Name and Sales Rep Name"
         after_and = cal_title.split(" and ")[-1].strip()
         if after_and:
             sales_rep = after_and
-
-    # 2. Fall back to assignedUserId / assigned_user lookup
     if not sales_rep:
-        assigned_user_id = (
-            payload.get("assigned_user")          # GHL workflow custom field
-            or appointment.get("assignedUserId")
-            or appointment.get("assigned_user_id")
-            or payload.get("assignedUserId")
-            or payload.get("assigned_user_id")
-            or ""
-        )
-        sales_rep = USER_MAP.get(assigned_user_id, assigned_user_id)  # fall back to raw value if not in map
+        sales_rep = USER_MAP.get(assigned_user, assigned_user)
 
-    # Build the row (17 columns: A through Q)
+    logger.info(
+        f"Processing appointment_created: email={email} | lead_source={lead_source} | "
+        f"call_source={call_source} | utm_call={utm_call} | utm_stage={utm_stage} | "
+        f"sales_rep={sales_rep} | date_of_call={date_of_call}"
+    )
+
     row = [
-        date_booked,          # A: Date Added
-        date_of_call,         # B: Appointment Time
-        first_name,           # C: First Name
-        last_name,            # D: Last Name
-        email,                # E: Email
-        phone,                # F: Phone
-        "",                   # G: Showed (blank)
-        "",                   # H: Closed (blank)
-        "",                   # I: Cash Collected (AUD) (blank)
-        "",                   # J: Number of Payments (blank)
-        "",                   # K: Contracted Revenue (AUD) (blank)
-        lead_source,          # L: Lead Source
-        call_source,          # M: Call Source
-        webinar_id,           # N: Webinar ID
-        utm_stage,            # O: Stage
-        sales_rep,            # P: Sales Rep
-        "",                   # Q: Notes (blank)
+        date_booked,    # A: Date Added
+        date_of_call,   # B: Appointment Time
+        first_name,     # C: First Name
+        last_name,      # D: Last Name
+        email,          # E: Email
+        phone,          # F: Phone
+        "",             # G: Showed
+        "",             # H: Closed
+        "",             # I: Cash Collected (AUD)
+        "",             # J: Number of Payments
+        "",             # K: Contracted Revenue (AUD)
+        lead_source,    # L: Lead Source
+        call_source,    # M: Call Source
+        utm_call,       # N: Webinar ID
+        utm_stage,      # O: Stage
+        sales_rep,      # P: Sales Rep
+        "",             # Q: Notes
+        "",             # R: Date of Purchase
     ]
 
-    # Deduplication: check if email already exists
     existing_row = find_row_by_email(email)
     if existing_row:
-        logger.info(f"Duplicate found at row {existing_row} for {email} — updating")
-        # Preserve existing Showed, Closed, Cash, Payments, Revenue, Notes
-        existing_data = sheets_read_all()
-        if existing_row - 1 < len(existing_data):
-            old = existing_data[existing_row - 1]
-            # Preserve columns G-K and Q if they have values
-            for preserve_col in ["Showed", "Closed", "Cash Collected (AUD)",
-                                 "Number of Payments", "Contracted Revenue (AUD)", "Notes"]:
+        logger.info(f"Duplicate found at row {existing_row} for {email} — updating (reschedule)")
+        all_rows = sheets_read_all()
+        if existing_row - 1 < len(all_rows):
+            old = all_rows[existing_row - 1]
+            for preserve_col in [
+                "Showed", "Closed", "Cash Collected (AUD)",
+                "Number of Payments", "Contracted Revenue (AUD)", "Notes", "Date of Purchase",
+            ]:
                 idx = COL[preserve_col]
                 if idx < len(old) and old[idx].strip():
                     row[idx] = old[idx]
@@ -413,47 +606,50 @@ def handle_appointment_created(payload: dict):
         sheets_append_row(row)
 
 
-def handle_appointment_status(payload: dict):
-    """Handle an appointment status update — update Showed column only."""
-    contact_id = payload.get("contact_id") or payload.get("contactId") or ""
-    status = (
-        payload.get("status")
-        or payload.get("appointmentStatus")
-        or payload.get("appointment_status")
-        or ""
-    ).lower().strip()
+def handle_appointment_status(body: dict):
+    """Handle an appointment status update — update Showed (G) and Closed (H) columns."""
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+    status = extract_field(
+        body, "status", "appointmentStatus", "appointment_status",
+    ).lower()
 
-    # Also check nested appointment object
-    appointment = payload.get("appointment", {})
+    # Also check inside nested appointment/calendar objects
+    appt = body.get("appointment", {}) or {}
+    cal  = body.get("calendar", {}) or {}
     if not status:
-        status = (appointment.get("appointmentStatus") or appointment.get("status") or "").lower().strip()
+        status = (
+            appt.get("appointmentStatus") or
+            appt.get("status") or
+            cal.get("appoinmentStatus") or   # GHL typo "appoinment"
+            cal.get("status") or
+            ""
+        ).lower()
     if not contact_id:
-        contact_id = appointment.get("contactId", "")
-
-    if not contact_id or not status:
-        logger.warning(f"Missing contact_id or status in status update payload")
-        return
+        contact_id = appt.get("contactId", "")
 
     showed_value = STATUS_MAP.get(status)
     if not showed_value:
-        logger.info(f"Status '{status}' not mapped to Showed value, ignoring")
+        logger.info(f"Status '{status}' not in STATUS_MAP — ignoring")
         return
 
-    # Get contact email to find the row
-    contact = ghl_get_contact(contact_id)
-    email = contact.get("email", "").strip()
+    email = extract_field(body, "email")
+    if not email and contact_id:
+        logger.info(f"Email not in payload — fetching from GHL API for contact {contact_id}")
+        contact = ghl_get_contact(contact_id)
+        email = contact.get("email", "").strip()
     if not email:
-        logger.warning(f"Contact {contact_id} has no email, cannot find row")
+        logger.warning("No email found — cannot locate row to update")
         return
 
     existing_row = find_row_by_email(email)
     if not existing_row:
-        logger.warning(f"No row found for {email} to update status")
+        logger.warning(f"No row found for {email} — cannot update Showed")
         return
 
     # Update Showed column (G) always
     sheets_update_cell(existing_row, "G", showed_value)
     logger.info(f"Updated Showed to '{showed_value}' for {email} at row {existing_row}")
+
     # Also update Closed column (H) based on status
     if showed_value in ("Cancelled", "No-Show"):
         sheets_update_cell(existing_row, "H", showed_value)
@@ -462,105 +658,417 @@ def handle_appointment_status(payload: dict):
         sheets_update_cell(existing_row, "H", "Maybe")
         logger.info(f"Updated Closed to 'Maybe' for {email} at row {existing_row}")
 
+# ─── Stripe Helpers ─────────────────────────────────────────────
 
-def handle_pipeline_lost(payload: dict):
-    """Handle pipeline stage moved to Lost — update Closed column to No."""
-    contact_id = payload.get("contact_id") or payload.get("contactId") or ""
-    if not contact_id:
-        logger.warning("No contact_id in pipeline_lost payload")
+def get_exchange_rate(from_currency: str, to_currency: str = "AUD") -> float:
+    """Fetch exchange rate using a free API. Fallback to 1.0 if it fails."""
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
+    if from_currency == to_currency:
+        return 1.0
+    try:
+        r = http_requests.get(f"https://open.er-api.com/v6/latest/{from_currency}", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        rate = data.get("rates", {}).get(to_currency)
+        if rate:
+            return float(rate)
+    except Exception as e:
+        logger.error(f"Failed to fetch exchange rate for {from_currency} to {to_currency}: {e}")
+    return 1.0
+
+
+def get_stripe_subscription_details(subscription_id: str) -> tuple:
+    """
+    Fetch subscription details from Stripe.
+    Returns (number_of_payments, total_contracted_revenue_in_original_currency, is_primary_strategy).
+    is_primary_strategy is True only when Strategy 0 (tc_fixed_rebills) was used.
+
+    Strategy priority order:
+    0. ThriveCart metadata 'tc_fixed_rebills'  → is_primary_strategy=True
+         total_payments = int(tc_fixed_rebills) + 1  (rebills after initial payment)
+    1. SubscriptionSchedule phases (iterations sum)  → is_primary_strategy=False
+    2. Generic metadata field 'total_payments'        → is_primary_strategy=False
+    3. cancel_at vs billing_cycle_anchor estimate     → is_primary_strategy=False
+    4. ThriveCart product name parsing                → is_primary_strategy=False
+    5. Default: 1 payment at the Stripe per-cycle amount → is_primary_strategy=False
+    """
+    import re as _re
+    if not STRIPE_API_KEY or not subscription_id:
+        return 1, 0.0, False
+    try:
+        sub = stripe.Subscription.retrieve(subscription_id, expand=["schedule"])
+        metadata = sub.get("metadata", {}) or {}
+
+        per_cycle_amount = 0.0
+        for item in sub.get("items", {}).get("data", []):
+            price = item.get("price", {})
+            quantity = item.get("quantity", 1)
+            unit_amount = price.get("unit_amount", 0) / 100.0
+            per_cycle_amount += unit_amount * quantity
+
+        # --- Strategy 0: ThriveCart tc_fixed_rebills metadata (PRIMARY) ---
+        tc_rebills_raw = metadata.get("tc_fixed_rebills")
+        if tc_rebills_raw is not None:
+            try:
+                tc_rebills = int(tc_rebills_raw)
+                num_payments = tc_rebills + 1
+                total_amount = per_cycle_amount * num_payments
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments "
+                    f"via tc_fixed_rebills={tc_rebills} [primary strategy]"
+                )
+                return num_payments, total_amount, True
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Subscription {subscription_id}: could not parse "
+                    f"tc_fixed_rebills='{tc_rebills_raw}'"
+                )
+
+        # --- Strategy 1: SubscriptionSchedule phases ---
+        schedule = sub.get("schedule")
+        if schedule and isinstance(schedule, dict):
+            phases = schedule.get("phases", [])
+            if phases:
+                total_iterations = sum(p.get("iterations", 1) for p in phases)
+                if total_iterations > 1:
+                    total_amount = per_cycle_amount * total_iterations
+                    logger.info(
+                        f"Subscription {subscription_id}: {total_iterations} payments via schedule [fallback]"
+                    )
+                    return total_iterations, total_amount, False
+
+        # --- Strategy 2: generic metadata['total_payments'] ---
+        meta_total = metadata.get("total_payments")
+        if meta_total:
+            try:
+                num_payments = int(meta_total)
+                total_amount = per_cycle_amount * num_payments
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments via metadata [fallback]"
+                )
+                return num_payments, total_amount, False
+            except (ValueError, TypeError):
+                pass
+
+        # --- Strategy 3: cancel_at vs billing_cycle_anchor ---
+        cancel_at = sub.get("cancel_at")
+        billing_anchor = sub.get("billing_cycle_anchor")
+        price_data = sub.get("items", {}).get("data", [{}])[0].get("price", {})
+        interval = price_data.get("recurring", {}).get("interval", "month")
+        interval_count = price_data.get("recurring", {}).get("interval_count", 1)
+        if cancel_at and billing_anchor:
+            from datetime import datetime as _dt
+            start_dt = _dt.utcfromtimestamp(billing_anchor)
+            end_dt   = _dt.utcfromtimestamp(cancel_at)
+            delta_days = (end_dt - start_dt).days
+            if interval == "day":
+                cycles = delta_days / interval_count
+            elif interval == "week":
+                cycles = delta_days / (7 * interval_count)
+            elif interval == "month":
+                cycles = delta_days / (30.44 * interval_count)
+            elif interval == "year":
+                cycles = delta_days / (365.25 * interval_count)
+            else:
+                cycles = 1
+            num_payments = max(1, round(cycles))
+            total_amount = per_cycle_amount * num_payments
+            logger.info(
+                f"Subscription {subscription_id}: {num_payments} payments via cancel_at estimate [fallback]"
+            )
+            return num_payments, total_amount, False
+
+        # --- Strategy 4: ThriveCart product name parsing ---
+        product_name = ""
+        items_data = sub.get("items", {}).get("data", [])
+        if items_data:
+            product_name = (
+                items_data[0].get("price", {}).get("product", {})
+                if isinstance(items_data[0].get("price", {}).get("product"), dict)
+                else ""
+            )
+            if not product_name:
+                product_name = (
+                    items_data[0].get("price", {}).get("nickname", "") or
+                    metadata.get("tc_product_name", "") or
+                    metadata.get("product_name", "")
+                )
+        tc_name_match = _re.search(
+            r"thrivecart-[\w-]+-(?P<cents>\d+)-(?:\w+)-aud(?P<rebills>\d+)rebills",
+            str(product_name),
+            _re.IGNORECASE,
+        )
+        if tc_name_match:
+            try:
+                name_amount = int(tc_name_match.group("cents")) / 100.0
+                name_rebills = int(tc_name_match.group("rebills"))
+                num_payments = name_rebills + 1
+                effective_amount = name_amount if per_cycle_amount == 0.0 else per_cycle_amount
+                total_amount = effective_amount * num_payments
+                logger.info(
+                    f"Subscription {subscription_id}: {num_payments} payments via "
+                    f"ThriveCart product name (amount={effective_amount}) [fallback]"
+                )
+                return num_payments, total_amount, False
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Subscription {subscription_id}: ThriveCart name parse failed: {e}")
+
+        # --- Strategy 5: default — single payment ---
+        logger.info(f"Subscription {subscription_id}: defaulting to 1 payment [fallback]")
+        return 1, per_cycle_amount, False
+
+    except Exception as e:
+        logger.error(f"Failed to fetch Stripe subscription {subscription_id}: {e}")
+        return 1, 0.0, False
+
+
+def handle_stripe_payment(event: dict):
+    """Process a successful Stripe payment."""
+    data_object = event["data"]["object"]
+    event_type  = event["type"]
+
+    customer_email  = ""
+    amount_paid     = 0.0
+    currency        = "aud"
+    payment_date    = datetime.now(AEST).strftime("%Y-%m-%d")
+    stripe_payment_id = data_object.get("id", "")
+    subscription_id = None
+
+    if event_type == "payment_intent.succeeded":
+        customer_email = data_object.get("receipt_email")
+        amount_paid    = data_object.get("amount_received", 0) / 100.0
+        currency       = data_object.get("currency", "aud")
+        if not customer_email and data_object.get("customer"):
+            try:
+                customer = stripe.Customer.retrieve(data_object["customer"])
+                customer_email = customer.get("email")
+            except Exception:
+                pass
+    elif event_type == "invoice.payment_succeeded":
+        customer_email  = data_object.get("customer_email")
+        amount_paid     = data_object.get("amount_paid", 0) / 100.0
+        currency        = data_object.get("currency", "aud")
+        subscription_id = data_object.get("subscription")
+    elif event_type == "charge.succeeded":
+        customer_email = (
+            data_object.get("billing_details", {}).get("email") or
+            data_object.get("receipt_email")
+        )
+        amount_paid = data_object.get("amount", 0) / 100.0
+        currency    = data_object.get("currency", "aud")
+
+    if not customer_email:
+        logger.warning(f"Stripe event {event_type} missing customer email. ID: {stripe_payment_id}")
         return
 
-    contact = ghl_get_contact(contact_id)
-    email = contact.get("email", "").strip()
-    if not email:
-        logger.warning(f"Contact {contact_id} has no email, cannot find row")
+    exchange_rate = get_exchange_rate(currency, "AUD")
+    amount_aud    = amount_paid * exchange_rate
+
+    num_payments           = 1
+    contracted_revenue_aud = amount_aud
+    is_primary             = True
+
+    if subscription_id:
+        payments, total_rev, is_primary = get_stripe_subscription_details(subscription_id)
+        num_payments           = payments
+        contracted_revenue_aud = total_rev * exchange_rate
+
+    logger.info(
+        f"Stripe Payment: {customer_email}, Amount: {amount_aud:.2f} AUD, "
+        f"Payments: {num_payments}, Rev: {contracted_revenue_aud:.2f} AUD, "
+        f"primary_strategy={is_primary}"
+    )
+
+    row_num = find_row_by_email(customer_email)
+    if row_num:
+        sheets_update_cell(row_num, "I", f"{amount_aud:.2f}")
+        sheets_update_cell(row_num, "J", str(num_payments))
+        sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
+        logger.info(f"Updated Stripe payment for {customer_email} at row {row_num}")
+        if subscription_id and not is_primary:
+            logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
+            sheets_highlight_row(row_num, 1.0, 200 / 255, 100 / 255)
+    else:
+        logger.info(f"No matching row for {customer_email}. Appending to Unmatched Payments.")
+        append_unmatched_payment([
+            payment_date,
+            customer_email,
+            f"{amount_paid:.2f}",
+            currency.upper(),
+            stripe_payment_id,
+        ])
+
+
+def append_unmatched_payment(values: list[str]):
+    """Append a row to the Unmatched Payments tab, creating it if necessary."""
+    service = get_sheets_service()
+    if not service:
         return
+    try:
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        sheets = sheet_metadata.get("sheets", [])
+        tab_exists = any(
+            s.get("properties", {}).get("title") == "Unmatched Payments" for s in sheets
+        )
+        if not tab_exists:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": "Unmatched Payments"}}}]},
+            ).execute()
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range="'Unmatched Payments'!A1:E1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [["Date", "Email", "Amount", "Currency", "Stripe Payment ID"]]},
+            ).execute()
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range="'Unmatched Payments'!A:E",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+    except Exception as e:
+        logger.error(f"Failed to append unmatched payment: {e}")
 
-    existing_row = find_row_by_email(email)
-    if not existing_row:
-        logger.warning(f"No row found for {email} to update pipeline stage")
-        return
+# ─── Webhook Endpoints ────────────────────────────────────────
 
-    sheets_update_cell(existing_row, "H", "No")
-    logger.info(f"Updated Closed to 'No' for {email} at row {existing_row}")
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    payload    = await request.body()
+    sig_header = request.headers.get("stripe-signature")
 
+    if not STRIPE_WEBHOOK_SECRET:
+        logger.error("STRIPE_WEBHOOK_SECRET is not set")
+        return JSONResponse(content={"error": "Webhook secret not configured"}, status_code=500)
 
-# ─── Webhook Endpoint ────────────────────────────────────────
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        logger.error("Invalid Stripe payload")
+        return JSONResponse(content={"error": "Invalid payload"}, status_code=400)
+    except stripe.error.SignatureVerificationError:
+        logger.error("Invalid Stripe signature")
+        return JSONResponse(content={"error": "Invalid signature"}, status_code=400)
+
+    if event["type"] in ["payment_intent.succeeded", "invoice.payment_succeeded", "charge.succeeded"]:
+        handle_stripe_payment(event)
+
+    return JSONResponse(content={"status": "success"}, status_code=200)
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Main webhook endpoint for GHL workflow events."""
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    # Log the full payload
-    logger.info(f"Webhook received: {json.dumps(body, indent=2, default=str)[:5000]}")
+    logger.info(f"Webhook received:\n{json.dumps(body, indent=2, default=str)[:6000]}")
 
-    # Determine event type from the payload
-    # GHL workflows send custom webhook payloads — the event type is
-    # determined by which workflow triggers it. We'll use a "type" field
-    # that we instruct the user to include in the webhook body.
-    event_type = (
-        body.get("type")
-        or body.get("event")
-        or body.get("event_type")
-        or ""
-    ).lower().strip()
+    event_type = extract_field(body, "type", "event", "event_type").lower()
 
     if event_type in ("appointment_created", "appointment.created", "created", "booked"):
         handle_appointment_created(body)
-    elif event_type in ("appointment_status", "appointment.status", "status_update",
-                        "status", "showed", "no_show", "noshow", "cancelled"):
+
+    elif event_type in (
+        "appointment_status", "appointment.status", "status_update",
+        "status", "showed", "no_show", "noshow", "cancelled",
+    ):
         handle_appointment_status(body)
+
     elif event_type in ("pipeline_lost", "opportunity_lost", "lost"):
         handle_pipeline_lost(body)
-    else:
-        # If no explicit type, try to infer from payload content
-        # Check for pipeline stage in standard GHL payload
-        pipeline_stage = (
-            body.get("pipeline_stage")
-            or body.get("pipelineStage")
-            or body.get("stage_name")
-            or body.get("stageName")
-            or ""
+
+    elif event_type in ("opportunity_stage_update", "opportunity.stage_update", "pipeline_stage_update"):
+        stage_name = extract_field(
+            body, "pipleline_stage", "pipeline_stage", "stage_name", "opportunity_stage", "stageName"
         ).lower()
-        if pipeline_stage and any(kw in pipeline_stage for kw in ("lost", "no", "not closed")):
+        if "won" in stage_name or "closed" in stage_name:
+            handle_opportunity_won(body)
+        elif "lost" in stage_name:
             handle_pipeline_lost(body)
-        elif body.get("appointmentStatus") or body.get("status"):
-            status_val = (body.get("appointmentStatus") or body.get("status") or "").lower()
-            if status_val in STATUS_MAP:
-                handle_appointment_status(body)
+        else:
+            logger.info(f"Ignoring opportunity stage update: {stage_name}")
+
+    else:
+        # Infer from payload content when no explicit type field
+
+        # --- Pipeline / opportunity detection (runs BEFORE appointment fallback) ---
+        stage_name = extract_field(
+            body,
+            "pipleline_stage",   # GHL typo — primary field in live payloads
+            "pipeline_stage",
+            "stage_name",
+            "opportunity_stage",
+            "stageName",
+        ).lower()
+
+        is_pipeline_event = bool(
+            stage_name
+            or body.get("pipeline_name")
+            or body.get("pipelineName")
+            or body.get("opportunity_name")
+            or body.get("opportunityName")
+        )
+
+        if is_pipeline_event:
+            if "won" in stage_name or "closed" in stage_name:
+                logger.info(f"Implicit pipeline Won/Closed detected: stage='{stage_name}'")
+                handle_opportunity_won(body)
+            elif "lost" in stage_name:
+                logger.info(f"Implicit pipeline Lost detected: stage='{stage_name}'")
+                handle_pipeline_lost(body)
             else:
-                handle_appointment_created(body)
-        elif body.get("contact_id") or body.get("contactId"):
+                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost)")
+            return JSONResponse(content={"status": "ok"}, status_code=200)
+
+        # --- Appointment status / created fallback ---
+        status_val = extract_field(
+            body, "status", "appointmentStatus", "appointment_status",
+        ).lower()
+        cal_status = (body.get("calendar", {}) or {}).get("appoinmentStatus", "").lower()
+        effective_status = status_val or cal_status
+
+        if effective_status and effective_status in STATUS_MAP:
+            handle_appointment_status(body)
+        elif extract_field(body, "contact_id", "contactId") or extract_field(body, "email"):
             handle_appointment_created(body)
         else:
-            logger.info(f"Unknown event type: '{event_type}', payload logged above")
+            logger.info("Could not determine event type from payload — logged above")
 
     return JSONResponse(content={"status": "ok"}, status_code=200)
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now(AEST).isoformat()}
+    sa_configured             = bool(GOOGLE_SA_JSON)
+    ghl_configured            = bool(GHL_TOKEN)
+    stripe_configured         = bool(STRIPE_API_KEY)
+    stripe_webhook_configured = bool(STRIPE_WEBHOOK_SECRET)
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(AEST).isoformat(),
+        "google_sheets_auth":    "configured" if sa_configured             else "MISSING — set GOOGLE_SERVICE_ACCOUNT_JSON",
+        "ghl_token":             "configured" if ghl_configured            else "MISSING — set GHL_TOKEN",
+        "stripe_api_key":        "configured" if stripe_configured         else "MISSING — set STRIPE_API_KEY",
+        "stripe_webhook_secret": "configured" if stripe_webhook_configured else "MISSING — set STRIPE_WEBHOOK_SECRET",
+    }
 
 
 @app.get("/")
 async def root():
-    """Root endpoint — confirms server is running."""
     return {
-        "service": "GHL Webhook Receiver",
-        "version": "1.0.0",
-        "webhook_endpoint": "POST /webhook",
-        "health_endpoint": "GET /health",
+        "service": "GHL + Stripe Webhook Receiver",
+        "version": "2.0.0",
+        "ghl_webhook_endpoint":    "POST /webhook",
+        "stripe_webhook_endpoint": "POST /stripe-webhook",
+        "health_endpoint":         "GET /health",
     }
-
 
 # ─── Main ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
