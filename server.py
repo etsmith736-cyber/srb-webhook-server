@@ -533,7 +533,17 @@ async def webhook(request: Request):
         handle_pipeline_lost(body)
     else:
         # If no explicit type, try to infer from payload content
-        if body.get("appointmentStatus") or body.get("status"):
+        # Check for pipeline stage in standard GHL payload
+        pipeline_stage = (
+            body.get("pipeline_stage")
+            or body.get("pipelineStage")
+            or body.get("stage_name")
+            or body.get("stageName")
+            or ""
+        ).lower()
+        if pipeline_stage and any(kw in pipeline_stage for kw in ("lost", "no", "not closed")):
+            handle_pipeline_lost(body)
+        elif body.get("appointmentStatus") or body.get("status"):
             status_val = (body.get("appointmentStatus") or body.get("status") or "").lower()
             if status_val in STATUS_MAP:
                 handle_appointment_status(body)
