@@ -8,14 +8,13 @@ Two event types:
   1. appointment_created  → add/update a row (dedup by email)
   2. appointment_status   → update the Showed column only
 
-Google Sheets access is via the `gws` CLI (pre-authenticated).
+Google Sheets access is via the Google Sheets API v4 (service account).
 GHL contact enrichment is via the GHL API v2.
 """
 
 import json
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -24,6 +23,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import requests as http_requests
 import uvicorn
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # ─── Configuration ────────────────────────────────────────────
 
@@ -183,24 +185,35 @@ def determine_call_source(contact: dict) -> str:
     return "Misc"
 
 
-# ─── Google Sheets Helpers (via gws CLI) ──────────────────────
+# ─── Google Sheets Helpers (via Sheets API v4) ───────────────
+
+def _get_sheets_service():
+    """Build and return an authenticated Google Sheets API service."""
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env var not set")
+    sa_info = json.loads(sa_json)
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
 
 def sheets_read_all() -> list[list[str]]:
     """Read all data from the Sales Calls tab."""
     try:
-        result = subprocess.run(
-            [
-                "gws", "sheets", "+read",
-                "--spreadsheet", SPREADSHEET_ID,
-                "--range", f"'{SHEET_TAB}'!A:Q",
-            ],
-            capture_output=True, text=True, timeout=15,
+        service = _get_sheets_service()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{SHEET_TAB}'!A:R",
+            )
+            .execute()
         )
-        if result.returncode != 0:
-            logger.error(f"gws read error: {result.stderr}")
-            return []
-        data = json.loads(result.stdout)
-        return data.get("values", [])
+        return result.get("values", [])
     except Exception as e:
         logger.error(f"Failed to read sheet: {e}")
         return []
@@ -222,24 +235,15 @@ def find_row_by_email(email: str) -> Optional[int]:
 def sheets_append_row(values: list[str]):
     """Append a new row to the Sales Calls tab."""
     try:
-        payload = json.dumps({"values": [values]})
-        result = subprocess.run(
-            [
-                "gws", "sheets", "spreadsheets", "values", "append",
-                "--params", json.dumps({
-                    "spreadsheetId": SPREADSHEET_ID,
-                    "range": f"'{SHEET_TAB}'!A:Q",
-                    "valueInputOption": "RAW",
-                    "insertDataOption": "INSERT_ROWS",
-                }),
-                "--json", payload,
-            ],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            logger.error(f"gws append error: {result.stderr}")
-        else:
-            logger.info(f"Row appended successfully")
+        service = _get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{SHEET_TAB}'!A:R",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [values]},
+        ).execute()
+        logger.info("Row appended successfully")
     except Exception as e:
         logger.error(f"Failed to append row: {e}")
 
@@ -247,23 +251,14 @@ def sheets_append_row(values: list[str]):
 def sheets_update_row(row_number: int, values: list[str]):
     """Update an existing row (1-based) in the Sales Calls tab."""
     try:
-        payload = json.dumps({"values": [values]})
-        result = subprocess.run(
-            [
-                "gws", "sheets", "spreadsheets", "values", "update",
-                "--params", json.dumps({
-                    "spreadsheetId": SPREADSHEET_ID,
-                    "range": f"'{SHEET_TAB}'!A{row_number}:Q{row_number}",
-                    "valueInputOption": "RAW",
-                }),
-                "--json", payload,
-            ],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            logger.error(f"gws update error: {result.stderr}")
-        else:
-            logger.info(f"Row {row_number} updated successfully")
+        service = _get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{SHEET_TAB}'!A{row_number}:R{row_number}",
+            valueInputOption="RAW",
+            body={"values": [values]},
+        ).execute()
+        logger.info(f"Row {row_number} updated successfully")
     except Exception as e:
         logger.error(f"Failed to update row {row_number}: {e}")
 
@@ -271,23 +266,14 @@ def sheets_update_row(row_number: int, values: list[str]):
 def sheets_update_cell(row_number: int, col_letter: str, value: str):
     """Update a single cell in the Sales Calls tab."""
     try:
-        payload = json.dumps({"values": [[value]]})
-        result = subprocess.run(
-            [
-                "gws", "sheets", "spreadsheets", "values", "update",
-                "--params", json.dumps({
-                    "spreadsheetId": SPREADSHEET_ID,
-                    "range": f"'{SHEET_TAB}'!{col_letter}{row_number}",
-                    "valueInputOption": "RAW",
-                }),
-                "--json", payload,
-            ],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            logger.error(f"gws cell update error: {result.stderr}")
-        else:
-            logger.info(f"Cell {col_letter}{row_number} updated to '{value}'")
+        service = _get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{SHEET_TAB}'!{col_letter}{row_number}",
+            valueInputOption="RAW",
+            body={"values": [[value]]},
+        ).execute()
+        logger.info(f"Cell {col_letter}{row_number} updated to '{value}'")
     except Exception as e:
         logger.error(f"Failed to update cell {col_letter}{row_number}: {e}")
 
