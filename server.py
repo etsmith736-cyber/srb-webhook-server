@@ -469,10 +469,13 @@ def handle_appointment_status(payload: dict):
     # Update Showed column (G) always
     sheets_update_cell(existing_row, "G", showed_value)
     logger.info(f"Updated Showed to '{showed_value}' for {email} at row {existing_row}")
-    # For Cancelled and No-Show, also update Closed column (H)
+    # Also update Closed column (H) based on status
     if showed_value in ("Cancelled", "No-Show"):
         sheets_update_cell(existing_row, "H", showed_value)
         logger.info(f"Updated Closed to '{showed_value}' for {email} at row {existing_row}")
+    elif showed_value == "Showed":
+        sheets_update_cell(existing_row, "H", "Maybe")
+        logger.info(f"Updated Closed to 'Maybe' for {email} at row {existing_row}")
 
 
 # ─── Webhook Endpoint ────────────────────────────────────────
