@@ -906,48 +906,10 @@ def handle_stripe_payment(event: dict):
             logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
             sheets_highlight_row(row_num, 1.0, 200 / 255, 100 / 255)
     else:
-        logger.info(f"No matching row for {customer_email}. Appending to Unmatched Payments.")
-        append_unmatched_payment([
-            payment_date,
-            customer_email,
-            f"{amount_paid:.2f}",
-            currency.upper(),
-            stripe_payment_id,
-        ])
-
-
-def append_unmatched_payment(values: list[str]):
-    """Append a row to the Unmatched Payments tab, creating it if necessary."""
-    service = get_sheets_service()
-    if not service:
-        return
-    try:
-        sheet_metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        sheets = sheet_metadata.get("sheets", [])
-        tab_exists = any(
-            s.get("properties", {}).get("title") == "Unmatched Payments" for s in sheets
+        logger.warning(
+            f"No matching row in Sales Calls for Stripe payment from {customer_email} "
+            f"(amount={amount_aud:.2f} AUD, id={stripe_payment_id}) — skipping for now"
         )
-        if not tab_exists:
-            service.spreadsheets().batchUpdate(
-                spreadsheetId=SPREADSHEET_ID,
-                body={"requests": [{"addSheet": {"properties": {"title": "Unmatched Payments"}}}]},
-            ).execute()
-            service.spreadsheets().values().append(
-                spreadsheetId=SPREADSHEET_ID,
-                range="'Unmatched Payments'!A1:E1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [["Date", "Email", "Amount", "Currency", "Stripe Payment ID"]]},
-            ).execute()
-        service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range="'Unmatched Payments'!A:E",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [values]},
-        ).execute()
-    except Exception as e:
-        logger.error(f"Failed to append unmatched payment: {e}")
 
 # ─── Webhook Endpoints ────────────────────────────────────────
 
