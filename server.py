@@ -533,19 +533,35 @@ def handle_appointment_created(body: dict):
         return
 
     now_aest    = datetime.now(AEST)
-    date_booked = now_aest.strftime("%Y-%m-%d %H:%M AEST")
+    date_booked = now_aest.strftime("%Y-%m-%d")
 
     date_of_call = ""
     if start_time_str:
         try:
-            # Strip timezone suffix and treat as local (AEST/Brisbane)
-            clean = str(start_time_str).replace("Z", "").split("+")[0]
-            parts = clean.split("T")
-            date_part = parts[0]
-            time_part = parts[1][:5] if len(parts) > 1 else ""
-            date_of_call = f"{date_part} {time_part} AEST" if time_part else date_part
+            s = str(start_time_str).strip()
+            # Try ISO format first (e.g. 2026-03-27T07:30:00+00:00 or 2026-03-27T07:30:00Z)
+            clean = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(clean)
+            date_of_call = dt.astimezone(AEST).strftime("%Y-%m-%d")
         except Exception:
-            date_of_call = str(start_time_str)[:20] if start_time_str else ""
+            try:
+                # Try human-readable GHL format: "Friday, 27 March 2026 5:30 PM"
+                # Strip day-of-week prefix if present
+                if ", " in s:
+                    s = s.split(", ", 1)[1]
+                # Try common human-readable patterns
+                for fmt in ("%d %B %Y %I:%M %p", "%d %B %Y", "%B %d, %Y %I:%M %p", "%B %d, %Y"):
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        date_of_call = dt.strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+        if not date_of_call:
+            # Last resort: take first 10 chars if it looks like a date
+            date_of_call = str(start_time_str)[:10]
 
     lead_source = determine_lead_source(utm_source, tags)
     call_source = determine_call_source(utm_call)
