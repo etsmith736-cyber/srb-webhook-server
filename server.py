@@ -906,10 +906,7 @@ def handle_stripe_payment(event: dict):
             logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
             sheets_highlight_row(row_num, 1.0, 200 / 255, 100 / 255)
     else:
-        logger.warning(
-            f"No matching row in Sales Calls for Stripe payment from {customer_email} "
-            f"(amount={amount_aud:.2f} AUD, id={stripe_payment_id}) — skipping for now"
-        )
+        pass  # No matching row — unmatched payment handling to be built later
 
 # ─── Webhook Endpoints ────────────────────────────────────────
 
