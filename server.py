@@ -392,7 +392,19 @@ def handle_opportunity_won(body: dict):
     sheets_update_cell(existing_row, "H", "Closed")
     logger.info(f"Updated Closed status for {email} at row {existing_row}")
 
-    # 2. Look up Stripe data
+    # 2. Check if I/J/K already have data (e.g. written by a prior Stripe webhook)
+    all_rows = sheets_read_all()
+    if existing_row - 1 < len(all_rows):
+        existing = all_rows[existing_row - 1]
+        cash_col = COL["Cash Collected (AUD)"]
+        if len(existing) > cash_col and existing[cash_col].strip():
+            logger.info(
+                f"Stripe data already present for {email} (row {existing_row}) — "
+                f"skipping Stripe lookup and highlight"
+            )
+            return
+
+    # 3. Look up Stripe data
     if not STRIPE_API_KEY:
         logger.warning("STRIPE_API_KEY not set — skipping Stripe lookup, highlighting row yellow")
         sheets_highlight_row(existing_row, 1.0, 1.0, 0.0)
