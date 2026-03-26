@@ -123,19 +123,20 @@ COL = {
 }
 
 TRIAGE_COL = {
-    "Date Added":       0,
-    "Appointment Time": 1,
-    "First Name":       2,
-    "Last Name":        3,
-    "Email":            4,
-    "Phone":            5,
-    "Setter":           6,
-    "Webinar ID":       7,
-    "Stage":            8,
-    "Lead Source":      9,
-    "Showed/Status":    10,
-    "Roadmap Booked":   11,
-    "Notes":            12,
+    "Date Added":       0,   # A
+    "Appointment Time": 1,   # B
+    "First Name":       2,   # C
+    "Last Name":        3,   # D
+    "Email":            4,   # E
+    "Phone":            5,   # F
+    "Showed/Status":    6,   # G
+    "Roadmap Booked":   7,   # H
+    "Lead Source":      8,   # I
+    "Call Source":      9,   # J
+    "Webinar ID":       10,  # K
+    "Stage":            11,  # L
+    "Setter":           12,  # M
+    "Notes":            13,  # N
 }
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -279,7 +280,7 @@ def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int =
     if email_col_idx is None:
         email_col_idx = COL["Email"] if tab == "Sales Calls" else TRIAGE_COL["Email"]
         
-    range_str = "A:R" if tab == "Sales Calls" else "A:M"
+    range_str = "A:R" if tab == "Sales Calls" else "A:N"
     rows = sheets_read_all(tab, range_str)
     email_lower = email.strip().lower()
     for i, row in enumerate(rows):
@@ -297,7 +298,7 @@ def sheets_append_row(values: list[str], tab: str = "Sales Calls"):
         logger.error("Cannot append row — Sheets service unavailable")
         return
     try:
-        range_str = "A:R" if tab == "Sales Calls" else "A:M"
+        range_str = "A:R" if tab == "Sales Calls" else "A:N"
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!{range_str}",
@@ -319,7 +320,7 @@ def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Call
         logger.error("Cannot update row — Sheets service unavailable")
         return
     try:
-        end_col = "R" if tab == "Sales Calls" else "M"
+        end_col = "R" if tab == "Sales Calls" else "N"
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!A{row_number}:{end_col}{row_number}",
@@ -645,7 +646,7 @@ def handle_appointment_created(body: dict):
     triage_row_num = find_row_by_email(email, tab="Triage Calls")
     if triage_row_num:
         logger.info(f"Found matching Triage Call for {email} at row {triage_row_num}")
-        triage_rows = sheets_read_all(tab="Triage Calls", range_str="A:M")
+        triage_rows = sheets_read_all(tab="Triage Calls", range_str="A:N")
         if triage_row_num - 1 < len(triage_rows):
             t_row = triage_rows[triage_row_num - 1]
             # Copy Webinar ID and Stage from Triage to Sales Calls
@@ -655,7 +656,7 @@ def handle_appointment_created(body: dict):
                 row[COL["Stage"]] = t_row[TRIAGE_COL["Stage"]]
         
         # Update the Triage Calls row to mark Roadmap Booked
-        sheets_update_cell(triage_row_num, "L", "Roadmap Booked", tab="Triage Calls")
+        sheets_update_cell(triage_row_num, "H", "Roadmap Booked", tab="Triage Calls")
 
     existing_row = find_row_by_email(email)
     if existing_row:
@@ -1086,26 +1087,29 @@ async def triage_booked(request: Request):
     if not setter:
         setter = USER_MAP.get(assigned_user, assigned_user)
 
+    call_source = determine_call_source(utm_call)
+
     row = [
-        date_booked,    # 0: Date Added
-        date_of_call,   # 1: Appointment Time
-        first_name,     # 2: First Name
-        last_name,      # 3: Last Name
-        email,          # 4: Email
-        phone,          # 5: Phone
-        setter,         # 6: Setter
-        utm_call,       # 7: Webinar ID
-        utm_stage,      # 8: Stage
-        lead_source,    # 9: Lead Source
-        "",             # 10: Showed/Status
-        "",             # 11: Roadmap Booked
-        "",             # 12: Notes
+        date_booked,    # 0:  A: Date Added
+        date_of_call,   # 1:  B: Appointment Time
+        first_name,     # 2:  C: First Name
+        last_name,      # 3:  D: Last Name
+        email,          # 4:  E: Email
+        phone,          # 5:  F: Phone
+        "",             # 6:  G: Showed/Status
+        "",             # 7:  H: Roadmap Booked
+        lead_source,    # 8:  I: Lead Source
+        call_source,    # 9:  J: Call Source
+        utm_call,       # 10: K: Webinar ID
+        utm_stage,      # 11: L: Stage
+        setter,         # 12: M: Setter
+        "",             # 13: N: Notes
     ]
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
         logger.info(f"Duplicate found at row {existing_row} in Triage Calls for {email} — updating")
-        all_rows = sheets_read_all(tab="Triage Calls", range_str="A:M")
+        all_rows = sheets_read_all(tab="Triage Calls", range_str="A:N")
         if existing_row - 1 < len(all_rows):
             old = all_rows[existing_row - 1]
             for preserve_col in ["Showed/Status", "Roadmap Booked", "Notes"]:
@@ -1143,7 +1147,7 @@ async def triage_cancelled(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "K", "Cancelled", tab="Triage Calls")
+        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
         logger.info(f"Updated Triage Call status to Cancelled for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to cancel")
@@ -1191,7 +1195,7 @@ async def triage_status(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "K", showed_value, tab="Triage Calls")
+        sheets_update_cell(existing_row, "G", showed_value, tab="Triage Calls")
         logger.info(f"Updated Triage Call status to '{showed_value}' for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to update status")
@@ -1302,7 +1306,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.5.0",
+        "version": "1.5.1",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
