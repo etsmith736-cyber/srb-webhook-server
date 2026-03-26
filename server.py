@@ -129,7 +129,7 @@ TRIAGE_COL = {
     "Last Name":        3,   # D
     "Email":            4,   # E
     "Phone":            5,   # F
-    "Showed/Status":    6,   # G
+    "Showed":           6,   # G
     "Roadmap Booked":   7,   # H
     "Lead Source":      8,   # I
     "Call Source":      9,   # J
@@ -1112,7 +1112,7 @@ async def triage_booked(request: Request):
         all_rows = sheets_read_all(tab="Triage Calls", range_str="A:N")
         if existing_row - 1 < len(all_rows):
             old = all_rows[existing_row - 1]
-            for preserve_col in ["Showed/Status", "Roadmap Booked", "Notes"]:
+            for preserve_col in ["Showed", "Roadmap Booked", "Notes"]:
                 idx = TRIAGE_COL[preserve_col]
                 if idx < len(old) and old[idx].strip():
                     row[idx] = old[idx]
@@ -1147,7 +1147,7 @@ async def triage_cancelled(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
+        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls") # Column G is now 'Showed'
         logger.info(f"Updated Triage Call status to Cancelled for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to cancel")
@@ -1195,7 +1195,7 @@ async def triage_status(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "G", showed_value, tab="Triage Calls")
+        sheets_update_cell(existing_row, "G", showed_value, tab="Triage Calls") # Column G is now 'Showed'
         logger.info(f"Updated Triage Call status to '{showed_value}' for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to update status")
@@ -1306,7 +1306,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.5.1",
+        "version": "1.5.2",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
