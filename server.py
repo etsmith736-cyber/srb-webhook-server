@@ -75,6 +75,9 @@ USER_MAP = {
     "Yio8In2ThZTJAAtagX3d": "Sofia Bernardi",
     "UUbR4IxnbflYaWe3jP9Y": "Swetashree Badu",
     "SUahnITFo9jHoijb8ReT": "Vada Rey-Matias",
+    # Setters
+    "Callum Elvin": "Callum Elvin",
+    "Samuel Broadbent": "Samuel Broadbent",
 }
 
 # ─── Ad source keywords ───────────────────────────────────────
@@ -117,6 +120,22 @@ COL = {
     "Sales Rep":                15,
     "Notes":                    16,
     "Date of Purchase":         17,
+}
+
+TRIAGE_COL = {
+    "Date Added":       0,
+    "Appointment Time": 1,
+    "First Name":       2,
+    "Last Name":        3,
+    "Email":            4,
+    "Phone":            5,
+    "Setter":           6,
+    "Webinar ID":       7,
+    "Stage":            8,
+    "Lead Source":      9,
+    "Showed/Status":    10,
+    "Roadmap Booked":   11,
+    "Notes":            12,
 }
 
 # ─── Logging ──────────────────────────────────────────────────
@@ -231,8 +250,8 @@ def get_cf_value(contact: dict, field_id: str) -> str:
 
 # ─── Google Sheets Helpers ────────────────────────────────────
 
-def sheets_read_all() -> list[list[str]]:
-    """Read all data from the Sales Calls tab."""
+def sheets_read_all(tab: str = "Sales Calls", range_str: str = "A:R") -> list[list[str]]:
+    """Read all data from the specified tab."""
     service = get_sheets_service()
     if not service:
         return []
@@ -242,74 +261,80 @@ def sheets_read_all() -> list[list[str]]:
             .values()
             .get(
                 spreadsheetId=SPREADSHEET_ID,
-                range="'Sales Calls'!A:R",
+                range=f"'{tab}'!{range_str}",
             )
             .execute()
         )
         return result.get("values", [])
     except HttpError as e:
-        logger.error(f"Sheets read error: {e}")
+        logger.error(f"Sheets read error for {tab}: {e}")
         return []
     except Exception as e:
-        logger.error(f"Failed to read sheet: {e}")
+        logger.error(f"Failed to read sheet {tab}: {e}")
         return []
 
 
-def find_row_by_email(email: str) -> Optional[int]:
-    """Return 1-based row number for an email match, or None."""
-    rows = sheets_read_all()
+def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int = None) -> Optional[int]:
+    """Return 1-based row number for an email match in the specified tab, or None."""
+    if email_col_idx is None:
+        email_col_idx = COL["Email"] if tab == "Sales Calls" else TRIAGE_COL["Email"]
+        
+    range_str = "A:R" if tab == "Sales Calls" else "A:M"
+    rows = sheets_read_all(tab, range_str)
     email_lower = email.strip().lower()
     for i, row in enumerate(rows):
         if i == 0:
             continue  # skip header
-        if len(row) > COL["Email"] and row[COL["Email"]].strip().lower() == email_lower:
+        if len(row) > email_col_idx and row[email_col_idx].strip().lower() == email_lower:
             return i + 1
     return None
 
 
-def sheets_append_row(values: list[str]):
-    """Append a new row to the Sales Calls tab."""
+def sheets_append_row(values: list[str], tab: str = "Sales Calls"):
+    """Append a new row to the specified tab."""
     service = get_sheets_service()
     if not service:
         logger.error("Cannot append row — Sheets service unavailable")
         return
     try:
+        range_str = "A:R" if tab == "Sales Calls" else "A:M"
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range="'Sales Calls'!A:R",
+            range=f"'{tab}'!{range_str}",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [values]},
         ).execute()
-        logger.info("Row appended successfully")
+        logger.info(f"Row appended successfully to {tab}")
     except HttpError as e:
-        logger.error(f"Sheets append error: {e}")
+        logger.error(f"Sheets append error for {tab}: {e}")
     except Exception as e:
-        logger.error(f"Failed to append row: {e}")
+        logger.error(f"Failed to append row to {tab}: {e}")
 
 
-def sheets_update_row(row_number: int, values: list[str]):
-    """Overwrite an existing row (1-based) in the Sales Calls tab."""
+def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Calls"):
+    """Overwrite an existing row (1-based) in the specified tab."""
     service = get_sheets_service()
     if not service:
         logger.error("Cannot update row — Sheets service unavailable")
         return
     try:
+        end_col = "R" if tab == "Sales Calls" else "M"
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'Sales Calls'!A{row_number}:R{row_number}",
+            range=f"'{tab}'!A{row_number}:{end_col}{row_number}",
             valueInputOption="RAW",
             body={"values": [values]},
         ).execute()
-        logger.info(f"Row {row_number} updated successfully")
+        logger.info(f"Row {row_number} updated successfully in {tab}")
     except HttpError as e:
-        logger.error(f"Sheets update error: {e}")
+        logger.error(f"Sheets update error for {tab}: {e}")
     except Exception as e:
-        logger.error(f"Failed to update row {row_number}: {e}")
+        logger.error(f"Failed to update row {row_number} in {tab}: {e}")
 
 
-def sheets_update_cell(row_number: int, col_letter: str, value: str):
-    """Update a single cell in the Sales Calls tab."""
+def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = "Sales Calls"):
+    """Update a single cell in the specified tab."""
     service = get_sheets_service()
     if not service:
         logger.error("Cannot update cell — Sheets service unavailable")
@@ -317,15 +342,15 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str):
     try:
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'Sales Calls'!{col_letter}{row_number}",
+            range=f"'{tab}'!{col_letter}{row_number}",
             valueInputOption="RAW",
             body={"values": [[value]]},
         ).execute()
-        logger.info(f"Cell {col_letter}{row_number} updated to '{value}'")
+        logger.info(f"Cell {col_letter}{row_number} updated to '{value}' in {tab}")
     except HttpError as e:
-        logger.error(f"Sheets cell update error: {e}")
+        logger.error(f"Sheets cell update error for {tab}: {e}")
     except Exception as e:
-        logger.error(f"Failed to update cell {col_letter}{row_number}: {e}")
+        logger.error(f"Failed to update cell {col_letter}{row_number} in {tab}: {e}")
 
 
 def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
@@ -614,6 +639,23 @@ def handle_appointment_created(body: dict):
         "",             # Q: Notes
         "",             # R: Date of Purchase
     ]
+
+    # --- Triage Cross-Reference ---
+    # Look up the email in the Triage Calls tab
+    triage_row_num = find_row_by_email(email, tab="Triage Calls")
+    if triage_row_num:
+        logger.info(f"Found matching Triage Call for {email} at row {triage_row_num}")
+        triage_rows = sheets_read_all(tab="Triage Calls", range_str="A:M")
+        if triage_row_num - 1 < len(triage_rows):
+            t_row = triage_rows[triage_row_num - 1]
+            # Copy Webinar ID and Stage from Triage to Sales Calls
+            if len(t_row) > TRIAGE_COL["Webinar ID"] and t_row[TRIAGE_COL["Webinar ID"]].strip():
+                row[COL["Webinar ID"]] = t_row[TRIAGE_COL["Webinar ID"]]
+            if len(t_row) > TRIAGE_COL["Stage"] and t_row[TRIAGE_COL["Stage"]].strip():
+                row[COL["Stage"]] = t_row[TRIAGE_COL["Stage"]]
+        
+        # Update the Triage Calls row to mark Roadmap Booked
+        sheets_update_cell(triage_row_num, "L", "Roadmap Booked", tab="Triage Calls")
 
     existing_row = find_row_by_email(email)
     if existing_row:
@@ -946,6 +988,217 @@ async def stripe_webhook(request: Request):
     return JSONResponse(content={"status": "success"}, status_code=200)
 
 
+@app.post("/triage-booked")
+async def triage_booked(request: Request):
+    """Handle a new triage call booking."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    logger.info(f"Triage booked webhook received:\n{json.dumps(body, indent=2, default=str)[:6000]}")
+
+    first_name = extract_field(body, "first_name", "firstName")
+    last_name  = extract_field(body, "last_name",  "lastName")
+    email      = extract_field(body, "email")
+    phone      = extract_field(body, "phone")
+    utm_call   = extract_field(body, "utm_call")
+    utm_stage  = extract_field(body, "utm_stage")
+    utm_source = extract_field(body, "utm_source")
+    tags       = extract_tags(body)
+
+    start_time_str = extract_field(
+        body, "appointment_start", "startTime", "start_time", "appointmentStartTime",
+    )
+    calendar_obj = body.get("calendar", {}) or {}
+    if not start_time_str:
+        start_time_str = str(calendar_obj.get("startTime", ""))
+
+    assigned_user = extract_field(
+        body, "assigned_user", "assignedUserId", "assigned_user_id",
+        "assignedUser", "calendarOwnerId",
+    )
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+
+    if not email and contact_id:
+        contact = ghl_get_contact(contact_id)
+        if contact:
+            first_name  = first_name  or contact.get("firstName", "")
+            last_name   = last_name   or contact.get("lastName",  "")
+            email       = email       or contact.get("email",     "")
+            phone       = phone       or contact.get("phone",     "")
+            utm_call    = utm_call    or get_cf_value(contact, CF_UTM_CALL)
+            utm_stage   = utm_stage   or get_cf_value(contact, CF_UTM_STAGE)
+            utm_source  = utm_source  or get_cf_value(contact, CF_UTM_SOURCE)
+            tags        = tags        or [t.lower() for t in contact.get("tags", [])]
+
+    if not email:
+        logger.warning("No email found for triage booked — skipping")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    now_aest = datetime.now(AEST)
+    date_booked = now_aest.strftime("%Y-%m-%d")
+
+    date_of_call = ""
+    if start_time_str:
+        try:
+            s = str(start_time_str).strip()
+            clean = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(clean)
+            if dt.tzinfo is None:
+                tz_name = (
+                    calendar_obj.get("selectedTimezone")
+                    or body.get("selectedTimezone")
+                    or "Australia/Brisbane"
+                )
+                try:
+                    import zoneinfo
+                    local_tz = zoneinfo.ZoneInfo(tz_name)
+                except Exception:
+                    import pytz
+                    local_tz = pytz.timezone(tz_name)
+                dt = dt.replace(tzinfo=local_tz)
+            date_of_call = dt.strftime("%Y-%m-%d")
+        except Exception:
+            try:
+                if ", " in s:
+                    s = s.split(", ", 1)[1]
+                for fmt in ("%d %B %Y %I:%M %p", "%d %B %Y", "%B %d, %Y %I:%M %p", "%B %d, %Y"):
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        date_of_call = dt.strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+        if not date_of_call:
+            date_of_call = str(start_time_str)[:10]
+
+    lead_source = determine_lead_source(utm_source, tags)
+    
+    setter = ""
+    cal_title = calendar_obj.get("title", "")
+    if cal_title and " and " in cal_title:
+        after_and = cal_title.split(" and ")[-1].strip()
+        if after_and:
+            setter = after_and
+    if not setter:
+        setter = USER_MAP.get(assigned_user, assigned_user)
+
+    row = [
+        date_booked,    # 0: Date Added
+        date_of_call,   # 1: Appointment Time
+        first_name,     # 2: First Name
+        last_name,      # 3: Last Name
+        email,          # 4: Email
+        phone,          # 5: Phone
+        setter,         # 6: Setter
+        utm_call,       # 7: Webinar ID
+        utm_stage,      # 8: Stage
+        lead_source,    # 9: Lead Source
+        "",             # 10: Showed/Status
+        "",             # 11: Roadmap Booked
+        "",             # 12: Notes
+    ]
+
+    existing_row = find_row_by_email(email, tab="Triage Calls")
+    if existing_row:
+        logger.info(f"Duplicate found at row {existing_row} in Triage Calls for {email} — updating")
+        all_rows = sheets_read_all(tab="Triage Calls", range_str="A:M")
+        if existing_row - 1 < len(all_rows):
+            old = all_rows[existing_row - 1]
+            for preserve_col in ["Showed/Status", "Roadmap Booked", "Notes"]:
+                idx = TRIAGE_COL[preserve_col]
+                if idx < len(old) and old[idx].strip():
+                    row[idx] = old[idx]
+        sheets_update_row(existing_row, row, tab="Triage Calls")
+    else:
+        logger.info(f"New triage contact {email} — appending row")
+        sheets_append_row(row, tab="Triage Calls")
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
+
+
+@app.post("/triage-cancelled")
+async def triage_cancelled(request: Request):
+    """Handle a triage call cancellation."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    logger.info(f"Triage cancelled webhook received:\n{json.dumps(body, indent=2, default=str)[:1000]}")
+    
+    email = extract_field(body, "email")
+    if not email:
+        contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = contact.get("email", "").strip()
+            
+    if not email:
+        logger.warning("No email found for triage cancelled — skipping")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    existing_row = find_row_by_email(email, tab="Triage Calls")
+    if existing_row:
+        sheets_update_cell(existing_row, "K", "Cancelled", tab="Triage Calls")
+        logger.info(f"Updated Triage Call status to Cancelled for {email} at row {existing_row}")
+    else:
+        logger.warning(f"No Triage Call row found for {email} to cancel")
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
+
+
+@app.post("/triage-status")
+async def triage_status(request: Request):
+    """Handle a triage call status update (Showed/No-Show)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    logger.info(f"Triage status webhook received:\n{json.dumps(body, indent=2, default=str)[:1000]}")
+    
+    status = extract_field(body, "status", "appointmentStatus", "appointment_status").lower()
+    appt = body.get("appointment", {}) or {}
+    cal  = body.get("calendar", {}) or {}
+    if not status:
+        status = (
+            appt.get("appointmentStatus") or
+            appt.get("status") or
+            cal.get("appoinmentStatus") or
+            cal.get("status") or
+            ""
+        ).lower()
+
+    showed_value = STATUS_MAP.get(status)
+    if not showed_value:
+        logger.info(f"Status '{status}' not in STATUS_MAP — ignoring")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    email = extract_field(body, "email")
+    if not email:
+        contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = contact.get("email", "").strip()
+            
+    if not email:
+        logger.warning("No email found for triage status — skipping")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    existing_row = find_row_by_email(email, tab="Triage Calls")
+    if existing_row:
+        sheets_update_cell(existing_row, "K", showed_value, tab="Triage Calls")
+        logger.info(f"Updated Triage Call status to '{showed_value}' for {email} at row {existing_row}")
+    else:
+        logger.warning(f"No Triage Call row found for {email} to update status")
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -1049,10 +1302,13 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "2.0.0",
-        "ghl_webhook_endpoint":    "POST /webhook",
+        "version": "1.5.0",
+        "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
-        "health_endpoint":         "GET /health",
+        "triage_booked_endpoint": "POST /triage-booked",
+        "triage_cancelled_endpoint": "POST /triage-cancelled",
+        "triage_status_endpoint": "POST /triage-status",
+        "health_endpoint": "GET /health",
     }
 
 # ─── Main ─────────────────────────────────────────────────────
