@@ -1226,8 +1226,13 @@ async def triage_status(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "G", showed_value, tab="Triage Calls") # Column G is now 'Showed'
-        logger.info(f"Updated Triage Call status to '{showed_value}' for {email} at row {existing_row}")
+        # Always update Showed (column G)
+        sheets_update_cell(existing_row, "G", showed_value, tab="Triage Calls")
+        logger.info(f"Updated Triage Call Showed to '{showed_value}' for {email} at row {existing_row}")
+        # When contact showed up, set Roadmap Booked (column H) to 'Maybe'
+        if showed_value == "Showed":
+            sheets_update_cell(existing_row, "H", "Maybe", tab="Triage Calls")
+            logger.info(f"Set Triage Call Roadmap Booked to 'Maybe' for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to update status")
 
@@ -1337,7 +1342,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.5.3",
+        "version": "1.5.4",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
