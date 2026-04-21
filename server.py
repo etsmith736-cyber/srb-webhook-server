@@ -953,6 +953,20 @@ def handle_stripe_payment(event: dict):
 
     row_num = find_row_by_email(customer_email)
     if row_num:
+        # Check if column I (Cash Collected) already has a value.
+        # If it does, this is a subsequent payment plan instalment — skip the
+        # update entirely to avoid overwriting the original sale data.
+        all_rows = sheets_read_all()
+        existing_row_data = all_rows[row_num - 1] if row_num - 1 < len(all_rows) else []
+        cash_col = COL["Cash Collected (AUD)"]  # index 8, column I
+        existing_cash = existing_row_data[cash_col].strip() if len(existing_row_data) > cash_col else ""
+        if existing_cash:
+            logger.info(
+                f"Skipping Stripe payment update for {customer_email} at row {row_num} — "
+                f"Cash Collected (column I) already has a value ('{existing_cash}'). "
+                f"Subsequent instalment payment ignored to preserve original sale data."
+            )
+            return
         sheets_update_cell(row_num, "I", f"{amount_aud:.2f}")
         sheets_update_cell(row_num, "J", str(num_payments))
         sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
