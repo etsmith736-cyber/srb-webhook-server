@@ -414,9 +414,10 @@ def handle_opportunity_won(body: dict):
         logger.warning(f"No row found for {email} — cannot update Closed status")
         return
 
-    # 1. Mark column H as "Closed"
+    # 1. Mark column G as "Showed" and column H as "Closed"
+    sheets_update_cell(existing_row, "G", "Showed")
     sheets_update_cell(existing_row, "H", "Closed")
-    logger.info(f"Updated Closed status for {email} at row {existing_row}")
+    logger.info(f"Updated Showed='Showed', Closed='Closed' for {email} at row {existing_row}")
 
     # 2. Check if I/J/K already have data (e.g. written by a prior Stripe webhook)
     all_rows = sheets_read_all()
@@ -523,8 +524,47 @@ def handle_pipeline_lost(body: dict):
         logger.warning(f"No row found for {email} — cannot update pipeline stage")
         return
 
+    sheets_update_cell(existing_row, "G", "Showed")
     sheets_update_cell(existing_row, "H", "No")
-    logger.info(f"Updated Closed to 'No' for {email} at row {existing_row}")
+    logger.info(f"Updated Showed='Showed', Closed='No' for {email} at row {existing_row}")
+
+
+def handle_pipeline_no_show(body: dict):
+    """Handle pipeline stage change to No-Show — update G and H."""
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+    email = extract_field(body, "email")
+    if not email and contact_id:
+        contact = ghl_get_contact(contact_id)
+        email = contact.get("email", "").strip()
+    if not email:
+        logger.warning("No email found — cannot update No-Show")
+        return
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update No-Show")
+        return
+    sheets_update_cell(existing_row, "G", "No-Show")
+    sheets_update_cell(existing_row, "H", "No-Show")
+    logger.info(f"Pipeline No-Show: updated G='No-Show', H='No-Show' for {email} at row {existing_row}")
+
+
+def handle_pipeline_decision_pending(body: dict):
+    """Handle pipeline stage change to Showed - Decision Pending or Long Term Follow Up."""
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+    email = extract_field(body, "email")
+    if not email and contact_id:
+        contact = ghl_get_contact(contact_id)
+        email = contact.get("email", "").strip()
+    if not email:
+        logger.warning("No email found — cannot update Decision Pending")
+        return
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update Decision Pending")
+        return
+    sheets_update_cell(existing_row, "G", "Showed")
+    sheets_update_cell(existing_row, "H", "Maybe")
+    logger.info(f"Pipeline Decision Pending: updated G='Showed', H='Maybe' for {email} at row {existing_row}")
 
 
 def handle_appointment_created(body: dict):
@@ -1288,6 +1328,10 @@ async def webhook(request: Request):
             handle_opportunity_won(body)
         elif "lost" in stage_name:
             handle_pipeline_lost(body)
+        elif "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
+            handle_pipeline_no_show(body)
+        elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
+            handle_pipeline_decision_pending(body)
         else:
             logger.info(f"Ignoring opportunity stage update: {stage_name}")
 
@@ -1319,8 +1363,14 @@ async def webhook(request: Request):
             elif "lost" in stage_name:
                 logger.info(f"Implicit pipeline Lost detected: stage='{stage_name}'")
                 handle_pipeline_lost(body)
+            elif "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
+                logger.info(f"Implicit pipeline No-Show detected: stage='{stage_name}'")
+                handle_pipeline_no_show(body)
+            elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
+                logger.info(f"Implicit pipeline Decision Pending/Follow Up detected: stage='{stage_name}'")
+                handle_pipeline_decision_pending(body)
             else:
-                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost)")
+                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost/No-Show/Decision Pending)")
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         # --- Appointment status / created fallback ---
