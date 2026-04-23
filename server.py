@@ -567,6 +567,25 @@ def handle_pipeline_decision_pending(body: dict):
     logger.info(f"Pipeline Decision Pending: updated G='Showed', H='Maybe' for {email} at row {existing_row}")
 
 
+def handle_pipeline_cancelled(body: dict):
+    """Handle pipeline stage change to Cancelled — update G and H in Sales Calls."""
+    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+    email = extract_field(body, "email")
+    if not email and contact_id:
+        contact = ghl_get_contact(contact_id)
+        email = contact.get("email", "").strip()
+    if not email:
+        logger.warning("No email found — cannot update Cancelled")
+        return
+    existing_row = find_row_by_email(email)
+    if not existing_row:
+        logger.warning(f"No row found for {email} — cannot update Cancelled")
+        return
+    sheets_update_cell(existing_row, "G", "Cancelled")
+    sheets_update_cell(existing_row, "H", "Cancelled")
+    logger.info(f"Pipeline Cancelled: updated G='Cancelled', H='Cancelled' for {email} at row {existing_row}")
+
+
 def handle_appointment_created(body: dict):
     """Handle a new appointment booking — add or update a row."""
     first_name = extract_field(body, "first_name", "firstName")
@@ -680,23 +699,6 @@ def handle_appointment_created(body: dict):
         "",             # Q: Notes
         "",             # R: Date of Purchase
     ]
-
-    # --- Triage Cross-Reference ---
-    # Look up the email in the Triage Calls tab
-    triage_row_num = find_row_by_email(email, tab="Triage Calls")
-    if triage_row_num:
-        logger.info(f"Found matching Triage Call for {email} at row {triage_row_num}")
-        triage_rows = sheets_read_all(tab="Triage Calls", range_str="A:N")
-        if triage_row_num - 1 < len(triage_rows):
-            t_row = triage_rows[triage_row_num - 1]
-            # Copy Webinar ID and Stage from Triage to Sales Calls
-            if len(t_row) > TRIAGE_COL["Webinar ID"] and t_row[TRIAGE_COL["Webinar ID"]].strip():
-                row[COL["Webinar ID"]] = t_row[TRIAGE_COL["Webinar ID"]]
-            if len(t_row) > TRIAGE_COL["Stage"] and t_row[TRIAGE_COL["Stage"]].strip():
-                row[COL["Stage"]] = t_row[TRIAGE_COL["Stage"]]
-        
-        # Update the Triage Calls row to mark Roadmap Booked
-        sheets_update_cell(triage_row_num, "H", "Yes", tab="Triage Calls")
 
     existing_row = find_row_by_email(email)
     if existing_row:
@@ -1297,6 +1299,62 @@ async def triage_status(request: Request):
     return JSONResponse(content={"status": "ok"}, status_code=200)
 
 
+@app.post("/triage-pipeline")
+async def triage_pipeline(request: Request):
+    """Handle triage pipeline stage changes — update Showed (G) and Roadmap Booked (H) in Triage Calls."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    logger.info(f"Triage pipeline webhook received:\n{json.dumps(body, indent=2, default=str)[:1000]}")
+
+    stage_name = extract_field(
+        body, "pipleline_stage", "pipeline_stage", "stage_name", "opportunity_stage", "stageName"
+    ).lower()
+
+    email = extract_field(body, "email")
+    if not email:
+        contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = contact.get("email", "").strip()
+
+    if not email:
+        logger.warning("No email found for triage pipeline event — skipping")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    existing_row = find_row_by_email(email, tab="Triage Calls")
+    if not existing_row:
+        logger.warning(f"No Triage Calls row found for {email} — cannot update pipeline stage")
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    if "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
+        sheets_update_cell(existing_row, "G", "No-Show", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "No-Show", tab="Triage Calls")
+        logger.info(f"Triage pipeline No-Show: G='No-Show', H='No-Show' for {email} at row {existing_row}")
+    elif "decision pending" in stage_name:
+        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "Maybe", tab="Triage Calls")
+        logger.info(f"Triage pipeline Decision Pending: G='Showed', H='Maybe' for {email} at row {existing_row}")
+    elif "won" in stage_name or "roadmap" in stage_name:
+        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "Yes", tab="Triage Calls")
+        logger.info(f"Triage pipeline Won/Roadmap: G='Showed', H='Yes' for {email} at row {existing_row}")
+    elif "lost" in stage_name:
+        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
+        logger.info(f"Triage pipeline Lost: G='Showed', H='No' for {email} at row {existing_row}")
+    elif "cancelled" in stage_name or "canceled" in stage_name:
+        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "Cancelled", tab="Triage Calls")
+        logger.info(f"Triage pipeline Cancelled: G='Cancelled', H='Cancelled' for {email} at row {existing_row}")
+    else:
+        logger.info(f"Triage pipeline: unrecognised stage '{stage_name}' for {email} — no update made")
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -1332,6 +1390,8 @@ async def webhook(request: Request):
             handle_pipeline_no_show(body)
         elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
             handle_pipeline_decision_pending(body)
+        elif "cancelled" in stage_name or "canceled" in stage_name:
+            handle_pipeline_cancelled(body)
         else:
             logger.info(f"Ignoring opportunity stage update: {stage_name}")
 
@@ -1369,8 +1429,11 @@ async def webhook(request: Request):
             elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
                 logger.info(f"Implicit pipeline Decision Pending/Follow Up detected: stage='{stage_name}'")
                 handle_pipeline_decision_pending(body)
+            elif "cancelled" in stage_name or "canceled" in stage_name:
+                logger.info(f"Implicit pipeline Cancelled detected: stage='{stage_name}'")
+                handle_pipeline_cancelled(body)
             else:
-                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost/No-Show/Decision Pending)")
+                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost/No-Show/Decision Pending/Cancelled)")
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         # --- Appointment status / created fallback ---
@@ -1417,6 +1480,7 @@ async def root():
         "triage_cancelled_endpoint": "POST /triage-cancelled",
         "triage_lost_endpoint": "POST /triage-lost",
         "triage_status_endpoint": "POST /triage-status",
+        "triage_pipeline_endpoint": "POST /triage-pipeline",
         "health_endpoint": "GET /health",
     }
 
