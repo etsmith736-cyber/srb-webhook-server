@@ -1134,14 +1134,7 @@ async def triage_booked(request: Request):
 
     lead_source = determine_lead_source(utm_source, tags)
     
-    setter = ""
-    cal_title = calendar_obj.get("title", "")
-    if cal_title and " and " in cal_title:
-        after_and = cal_title.split(" and ")[-1].strip()
-        if after_and:
-            setter = after_and
-    if not setter:
-        setter = USER_MAP.get(assigned_user, assigned_user)
+    setter = assigned_user if assigned_user else ""
 
     call_source = determine_call_source(utm_call)
 
