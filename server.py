@@ -1055,6 +1055,34 @@ async def triage_booked(request: Request):
 
     logger.info(f"Triage booked webhook received:\n{json.dumps(body, indent=2, default=str)[:6000]}")
 
+    # --- DEBUG: log every user/assignment-related field to diagnose setter mapping ---
+    _user_fields = [
+        "assigned_user", "assignedUserId", "assigned_user_id", "assignedUser",
+        "calendarOwnerId", "selectedUsers", "userId", "user_id",
+        "appoinmentStatus",  # GHL misspelling
+        "appointmentStatus",
+    ]
+    _calendar_obj_debug = body.get("calendar", {}) or {}
+    logger.info(
+        "[DEBUG triage-setter] Top-level user fields: " +
+        ", ".join(f"{k}={repr(body.get(k))}" for k in _user_fields)
+    )
+    logger.info(
+        "[DEBUG triage-setter] calendar obj user fields: " +
+        f"calendarOwnerId={repr(_calendar_obj_debug.get('calendarOwnerId'))} "
+        f"selectedUsers={repr(_calendar_obj_debug.get('selectedUsers'))} "
+        f"userId={repr(_calendar_obj_debug.get('userId'))} "
+        f"appoinmentStatus={repr(_calendar_obj_debug.get('appoinmentStatus'))}"
+    )
+    _contact_obj_debug = body.get("contact", {}) or {}
+    logger.info(
+        "[DEBUG triage-setter] contact obj: " +
+        f"assignedTo={repr(_contact_obj_debug.get('assignedTo'))} "
+        f"assignedUser={repr(_contact_obj_debug.get('assignedUser'))} "
+        f"userId={repr(_contact_obj_debug.get('userId'))}"
+    )
+    # --- END DEBUG ---
+
     first_name = extract_field(body, "first_name", "firstName")
     last_name  = extract_field(body, "last_name",  "lastName")
     email      = extract_field(body, "email")
