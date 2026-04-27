@@ -1099,15 +1099,13 @@ async def triage_booked(request: Request):
     if not start_time_str:
         start_time_str = str(calendar_obj.get("startTime", ""))
 
-    # Read assigned_user: GHL sends the name directly in the flat custom body key
-    # "assigned_user" (mapped to {{appointment.user.name}}). Read it directly from
-    # body first; only fall back to nested/ID fields if the flat key is absent.
+    # Read setter name: first try customData.assigned_user, then fall back to
+    # user.firstName. Both have been confirmed present in the webhook payload.
     assigned_user = (
-        str(body.get("assigned_user", "") or "").strip()
-        or str((body.get("calendar", {}) or {}).get("calendarOwnerId", "") or "").strip()
-        or extract_field(body, "assignedUserId", "assigned_user_id", "assignedUser", "calendarOwnerId")
+        str((body.get("customData", {}) or {}).get("assigned_user", "") or "").strip()
+        or str((body.get("user", {}) or {}).get("firstName", "") or "").strip()
     )
-    logger.info(f"[DEBUG triage-setter] resolved assigned_user={repr(assigned_user)}")
+    logger.info(f"[triage-setter] setter value extracted: {repr(assigned_user)}")
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
 
     if not email and contact_id:
