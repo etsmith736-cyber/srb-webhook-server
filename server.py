@@ -1099,10 +1099,15 @@ async def triage_booked(request: Request):
     if not start_time_str:
         start_time_str = str(calendar_obj.get("startTime", ""))
 
-    assigned_user = extract_field(
-        body, "assigned_user", "assignedUserId", "assigned_user_id",
-        "assignedUser", "calendarOwnerId",
+    # Read assigned_user: GHL sends the name directly in the flat custom body key
+    # "assigned_user" (mapped to {{appointment.user.name}}). Read it directly from
+    # body first; only fall back to nested/ID fields if the flat key is absent.
+    assigned_user = (
+        str(body.get("assigned_user", "") or "").strip()
+        or str((body.get("calendar", {}) or {}).get("calendarOwnerId", "") or "").strip()
+        or extract_field(body, "assignedUserId", "assigned_user_id", "assignedUser", "calendarOwnerId")
     )
+    logger.info(f"[DEBUG triage-setter] resolved assigned_user={repr(assigned_user)}")
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
 
     if not email and contact_id:
