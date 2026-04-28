@@ -30,6 +30,8 @@ import json
 import logging
 import os
 import sys
+import time
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -53,6 +55,12 @@ PORT                  = int(os.environ.get("PORT",              "8000"))
 STRIPE_API_KEY        = os.environ.get("STRIPE_API_KEY",        "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 GOOGLE_SA_JSON        = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+
+# Zoom Server-to-Server OAuth
+ZOOM_ACCOUNT_ID       = os.environ.get("ZOOM_ACCOUNT_ID",       "")
+ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
+ZOOM_CLIENT_SECRET    = os.environ.get("ZOOM_CLIENT_SECRET",    "")
+ZOOM_WEBINAR_ID       = os.environ.get("ZOOM_WEBINAR_ID",       "")
 
 import stripe
 if STRIPE_API_KEY:
@@ -1477,6 +1485,267 @@ async def webhook(request: Request):
     return JSONResponse(content={"status": "ok"}, status_code=200)
 
 
+# ─── Zoom Token Cache ────────────────────────────────────────
+#
+# The Zoom Server-to-Server OAuth token lasts 1 hour.  We cache it
+# in memory with a safety margin of 5 minutes so we never present
+# an expired token to the Zoom API.
+# ─────────────────────────────────────────────────────────────
+
+_zoom_token_lock = threading.Lock()
+_zoom_token_cache = {
+    "access_token": None,
+    "expires_at": 0.0,          # epoch seconds
+}
+
+
+def get_zoom_access_token() -> str:
+    """
+    Return a valid Zoom access token, fetching a new one only when
+    the cached token is missing or about to expire (< 5 min left).
+    Raises RuntimeError on failure.
+    """
+    with _zoom_token_lock:
+        if (
+            _zoom_token_cache["access_token"]
+            and time.time() < _zoom_token_cache["expires_at"] - 300
+        ):
+            return _zoom_token_cache["access_token"]
+
+    # Fetch a new token
+    logger.info("Requesting new Zoom Server-to-Server OAuth token")
+    try:
+        resp = http_requests.post(
+            "https://zoom.us/oauth/token",
+            params={
+                "grant_type": "account_credentials",
+                "account_id": ZOOM_ACCOUNT_ID,
+            },
+            auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        logger.error(f"Zoom OAuth token request failed: {exc}")
+        raise RuntimeError(f"Zoom OAuth token request failed: {exc}") from exc
+
+    token = data.get("access_token")
+    expires_in = data.get("expires_in", 3600)
+    if not token:
+        logger.error(f"Zoom OAuth response missing access_token: {data}")
+        raise RuntimeError("Zoom OAuth response missing access_token")
+
+    with _zoom_token_lock:
+        _zoom_token_cache["access_token"] = token
+        _zoom_token_cache["expires_at"] = time.time() + expires_in
+
+    logger.info(f"Zoom token cached, expires in {expires_in}s")
+    return token
+
+
+def register_zoom_webinar(first_name: str, last_name: str, email: str) -> dict:
+    """
+    Register a person for the Zoom webinar specified by ZOOM_WEBINAR_ID.
+    Returns the full Zoom API response dict (contains join_url, etc.).
+    Raises RuntimeError on failure.
+    """
+    token = get_zoom_access_token()
+    url = f"https://api.zoom.us/v2/webinars/{ZOOM_WEBINAR_ID}/registrants"
+    payload = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": email,
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    logger.info(f"Registering {email} for Zoom webinar {ZOOM_WEBINAR_ID}")
+    try:
+        resp = http_requests.post(url, json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except http_requests.exceptions.HTTPError as exc:
+        body = exc.response.text if exc.response is not None else "(no body)"
+        logger.error(f"Zoom registrant API error {exc.response.status_code}: {body}")
+        raise RuntimeError(f"Zoom API error {exc.response.status_code}: {body}") from exc
+    except Exception as exc:
+        logger.error(f"Zoom registrant request failed: {exc}")
+        raise RuntimeError(f"Zoom registrant request failed: {exc}") from exc
+
+
+def update_ghl_contact_zoom_link(contact_id: str, join_url: str) -> None:
+    """
+    Write the Zoom webinar join_url into the GHL contact's custom field
+    'contact.zoom_webinar_join_link'.
+    Raises RuntimeError on failure.
+    """
+    url = f"{GHL_BASE_URL}/contacts/{contact_id}"
+    headers = {
+        "Authorization": f"Bearer {GHL_TOKEN}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "customFields": [
+            {
+                "key": "contact.zoom_webinar_join_link",
+                "field_value": join_url,
+            }
+        ]
+    }
+    logger.info(f"Updating GHL contact {contact_id} with join_url")
+    try:
+        resp = http_requests.put(url, json=body, headers=headers, timeout=15)
+        resp.raise_for_status()
+        logger.info(f"GHL contact {contact_id} updated successfully")
+    except http_requests.exceptions.HTTPError as exc:
+        resp_body = exc.response.text if exc.response is not None else "(no body)"
+        logger.error(f"GHL update error {exc.response.status_code}: {resp_body}")
+        raise RuntimeError(f"GHL API error {exc.response.status_code}: {resp_body}") from exc
+    except Exception as exc:
+        logger.error(f"GHL update request failed: {exc}")
+        raise RuntimeError(f"GHL update request failed: {exc}") from exc
+
+
+# ─── Zoom Webinar Registration Endpoint ──────────────────────
+#
+# POST /zoom-register
+#
+# Receives a GHL form-submission webhook, extracts the contact's
+# first_name, last_name, email, and contact_id from the payload,
+# registers them as a Zoom webinar attendee via Server-to-Server
+# OAuth, and writes the unique join_url back to the GHL contact's
+# custom field "zoom_webinar_join_link".
+#
+# Flow:
+#   1. Parse & log the incoming GHL payload
+#   2. Obtain a cached Zoom S2S OAuth token
+#   3. POST to Zoom /webinars/{id}/registrants
+#   4. PUT the join_url back to the GHL contact
+#   5. Return success / error JSON
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/zoom-register")
+async def zoom_register(request: Request):
+    # --- 1. Receive and log the full payload ---
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logger.debug(f"[zoom-register] Full incoming payload: {json.dumps(body, default=str)}")
+    logger.info("[zoom-register] Received webhook request")
+
+    # --- Extract required fields (try many common GHL key variants) ---
+    first_name = extract_field(
+        body,
+        "first_name", "firstName", "first_Name", "fname",
+        "contact_first_name", "contact.first_name",
+        "full_name",  # fallback: will split below
+    )
+    last_name = extract_field(
+        body,
+        "last_name", "lastName", "last_Name", "lname",
+        "contact_last_name", "contact.last_name",
+    )
+    email = extract_field(
+        body,
+        "email", "Email", "contact_email", "contact.email",
+    )
+    contact_id = extract_field(
+        body,
+        "contact_id", "contactId", "contact.id", "id",
+    )
+
+    # If we only got a full_name and no last_name, try to split it
+    if first_name and not last_name and " " in first_name:
+        parts = first_name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1]
+
+    # Fallback: if still missing, try the nested 'contact' object directly
+    contact_obj = body.get("contact", {}) or {}
+    if not first_name:
+        first_name = contact_obj.get("firstName", "") or contact_obj.get("first_name", "")
+    if not last_name:
+        last_name = contact_obj.get("lastName", "") or contact_obj.get("last_name", "")
+    if not email:
+        email = contact_obj.get("email", "")
+    if not contact_id:
+        contact_id = contact_obj.get("id", "")
+
+    # Validate required fields
+    missing = []
+    if not first_name:
+        missing.append("first_name")
+    if not email:
+        missing.append("email")
+    if not contact_id:
+        missing.append("contact_id")
+    if missing:
+        msg = f"Missing required fields: {', '.join(missing)}"
+        logger.warning(f"[zoom-register] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=400)
+
+    # Default last_name to a single dot if truly empty (Zoom requires it)
+    if not last_name:
+        last_name = "."
+
+    logger.info(
+        f"[zoom-register] Registering: {first_name} {last_name} <{email}> "
+        f"(contact_id={contact_id})"
+    )
+
+    # --- 2 & 3. Zoom OAuth + register as webinar attendee ---
+    if not ZOOM_WEBINAR_ID:
+        msg = "ZOOM_WEBINAR_ID environment variable is not set"
+        logger.error(f"[zoom-register] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=500)
+
+    try:
+        zoom_resp = register_zoom_webinar(first_name, last_name, email)
+    except RuntimeError as exc:
+        return JSONResponse(
+            content={"status": "error", "detail": str(exc)},
+            status_code=502,
+        )
+
+    join_url = zoom_resp.get("join_url", "")
+    if not join_url:
+        msg = f"Zoom API did not return a join_url. Response: {zoom_resp}"
+        logger.error(f"[zoom-register] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=502)
+
+    logger.info(f"[zoom-register] Got join_url for {email}: {join_url}")
+
+    # --- 4. Write join_url back to GHL contact ---
+    try:
+        update_ghl_contact_zoom_link(contact_id, join_url)
+    except RuntimeError as exc:
+        # The Zoom registration succeeded but GHL update failed.
+        # Return partial success so the caller knows the join_url.
+        return JSONResponse(
+            content={
+                "status": "partial",
+                "detail": f"Zoom registration succeeded but GHL update failed: {exc}",
+                "join_url": join_url,
+            },
+            status_code=207,
+        )
+
+    # --- 5. Success ---
+    logger.info(f"[zoom-register] Completed successfully for {email}")
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "email": email,
+            "join_url": join_url,
+        },
+        status_code=200,
+    )
+
+
 @app.get("/health")
 async def health():
     sa_configured             = bool(GOOGLE_SA_JSON)
@@ -1497,7 +1766,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.5.5",
+        "version": "1.6.0",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
@@ -1505,6 +1774,7 @@ async def root():
         "triage_lost_endpoint": "POST /triage-lost",
         "triage_status_endpoint": "POST /triage-status",
         "triage_pipeline_endpoint": "POST /triage-pipeline",
+        "zoom_register_endpoint": "POST /zoom-register",
         "health_endpoint": "GET /health",
     }
 
