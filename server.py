@@ -1590,7 +1590,7 @@ def update_ghl_contact_zoom_link(contact_id: str, join_url: str) -> None:
     body = {
         "customFields": [
             {
-                "key": "contact.zoom_webinar_join_link",
+                "id": "S2sPJyNTkufF8hwru7Wz",
                 "field_value": join_url,
             }
         ]
