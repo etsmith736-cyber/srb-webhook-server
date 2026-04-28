@@ -1688,9 +1688,7 @@ async def zoom_register(request: Request):
         logger.warning(f"[zoom-register] {msg}")
         return JSONResponse(content={"status": "error", "detail": msg}, status_code=400)
 
-    # Default last_name to a single dot if truly empty (Zoom requires it)
-    if not last_name:
-        last_name = "."
+    # Leave last_name empty if not provided — Zoom does not require it
 
     logger.info(
         f"[zoom-register] Registering: {first_name} {last_name} <{email}> "
