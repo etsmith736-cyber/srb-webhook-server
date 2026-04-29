@@ -1027,6 +1027,24 @@ def handle_stripe_payment(event: dict):
         sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
         sheets_update_cell(row_num, "R", payment_date)
         logger.info(f"Updated Stripe payment for {customer_email} at row {row_num} (purchase date: {payment_date})")
+
+        # Validate: flag row red if Date of Purchase is before Appointment Date
+        appt_col = COL["Appointment Time"]  # index 1, column B
+        appt_date_str = existing_row_data[appt_col].strip() if len(existing_row_data) > appt_col else ""
+        if appt_date_str and payment_date:
+            try:
+                # Try parsing appointment date (YYYY-MM-DD format)
+                appt_date = datetime.strptime(appt_date_str[:10], "%Y-%m-%d").date()
+                purchase_date = datetime.strptime(payment_date, "%Y-%m-%d").date()
+                if purchase_date < appt_date:
+                    logger.warning(
+                        f"Date of Purchase ({payment_date}) is BEFORE Appointment Date ({appt_date_str}) "
+                        f"for {customer_email} at row {row_num} — flagging row red"
+                    )
+                    sheets_highlight_row(row_num, 1.0, 0.0, 0.0)  # Red highlight
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse dates for validation: appt='{appt_date_str}', purchase='{payment_date}': {e}")
+
         if subscription_id and not is_primary:
             logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
             sheets_highlight_row(row_num, 1.0, 200 / 255, 100 / 255)
