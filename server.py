@@ -952,7 +952,12 @@ def handle_stripe_payment(event: dict):
     customer_email  = ""
     amount_paid     = 0.0
     currency        = "aud"
-    payment_date    = datetime.now(AEST).strftime("%Y-%m-%d")
+    # Use Stripe's event creation timestamp for the actual purchase date
+    stripe_created = data_object.get("created", 0)
+    if stripe_created:
+        payment_date = datetime.fromtimestamp(stripe_created, tz=AEST).strftime("%Y-%m-%d")
+    else:
+        payment_date = datetime.now(AEST).strftime("%Y-%m-%d")
     stripe_payment_id = data_object.get("id", "")
     subscription_id = None
 
@@ -1020,7 +1025,8 @@ def handle_stripe_payment(event: dict):
         sheets_update_cell(row_num, "I", f"{amount_aud:.2f}")
         sheets_update_cell(row_num, "J", str(num_payments))
         sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
-        logger.info(f"Updated Stripe payment for {customer_email} at row {row_num}")
+        sheets_update_cell(row_num, "R", payment_date)
+        logger.info(f"Updated Stripe payment for {customer_email} at row {row_num} (purchase date: {payment_date})")
         if subscription_id and not is_primary:
             logger.info(f"Fallback strategy used for {customer_email} — highlighting row orange")
             sheets_highlight_row(row_num, 1.0, 200 / 255, 100 / 255)
