@@ -1022,9 +1022,9 @@ def handle_stripe_payment(event: dict):
                 f"Subsequent instalment payment ignored to preserve original sale data."
             )
             return
-        sheets_update_cell(row_num, "I", f"{amount_aud:.2f}")
+        sheets_update_cell(row_num, "I", f"${amount_aud:,.2f}")
         sheets_update_cell(row_num, "J", str(num_payments))
-        sheets_update_cell(row_num, "K", f"{contracted_revenue_aud:.2f}")
+        sheets_update_cell(row_num, "K", f"${contracted_revenue_aud:,.2f}")
         sheets_update_cell(row_num, "R", payment_date)
         logger.info(f"Updated Stripe payment for {customer_email} at row {row_num} (purchase date: {payment_date})")
 
