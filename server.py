@@ -1397,6 +1397,10 @@ async def triage_pipeline(request: Request):
         sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
         sheets_update_cell(existing_row, "H", "Yes", tab="Triage Calls")
         logger.info(f"Triage pipeline Won/Roadmap: G='Showed', H='Yes' for {email} at row {existing_row}")
+    elif "wrong fit" in stage_name:
+        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+        sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
+        logger.info(f"Triage pipeline Wrong Fit: G='Showed', H='No' for {email} at row {existing_row}")
     elif "lost" in stage_name:
         sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
         sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
