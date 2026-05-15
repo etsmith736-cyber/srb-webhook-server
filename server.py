@@ -26,6 +26,9 @@ Authentication:
 All sensitive values are read from environment variables — nothing is hardcoded.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -61,6 +64,10 @@ ZOOM_ACCOUNT_ID       = os.environ.get("ZOOM_ACCOUNT_ID",       "")
 ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
 ZOOM_CLIENT_SECRET    = os.environ.get("ZOOM_CLIENT_SECRET",    "")
 ZOOM_WEBINAR_ID       = os.environ.get("ZOOM_WEBINAR_ID",       "")
+
+# Fathom (one or more signing secrets, comma-separated)
+FATHOM_WEBHOOK_SECRETS_RAW = os.environ.get("FATHOM_WEBHOOK_SECRETS", "")
+FATHOM_API_KEY             = os.environ.get("FATHOM_API_KEY", "")
 
 import stripe
 if STRIPE_API_KEY:
@@ -402,6 +409,125 @@ def sheets_highlight_row(row_number: int, red: float, green: float, blue: float)
         logger.info(f"Row {row_number} highlighted successfully")
     except Exception as e:
         logger.error(f"Failed to highlight row {row_number}: {e}")
+
+# ─── Fathom Helpers ───────────────────────────────────────────
+
+def _fathom_secrets() -> list[str]:
+    """Return the list of configured Fathom webhook signing secrets."""
+    return [s.strip() for s in FATHOM_WEBHOOK_SECRETS_RAW.split(",") if s.strip()]
+
+
+def verify_fathom_signature(headers: dict, raw_body: bytes) -> tuple[bool, str]:
+    """
+    Verify a Standard Webhooks-style signature using any of the configured
+    FATHOM_WEBHOOK_SECRETS. Returns (ok, reason).
+    """
+    webhook_id        = headers.get("webhook-id", "")
+    webhook_timestamp = headers.get("webhook-timestamp", "")
+    webhook_signature = headers.get("webhook-signature", "")
+
+    if not (webhook_id and webhook_timestamp and webhook_signature):
+        return False, "missing webhook headers"
+
+    try:
+        ts = int(webhook_timestamp)
+    except ValueError:
+        return False, "invalid timestamp"
+    if abs(int(time.time()) - ts) > 300:
+        return False, "timestamp outside 5-minute tolerance"
+
+    signed_content = f"{webhook_id}.{webhook_timestamp}.".encode() + raw_body
+
+    header_sigs: list[str] = []
+    for part in webhook_signature.split(" "):
+        if "," in part:
+            ver, sig = part.split(",", 1)
+            if ver.strip() == "v1" and sig.strip():
+                header_sigs.append(sig.strip())
+    if not header_sigs:
+        return False, "no v1 signatures in header"
+
+    secrets = _fathom_secrets()
+    if not secrets:
+        return False, "no FATHOM_WEBHOOK_SECRETS configured"
+
+    for raw_secret in secrets:
+        secret = raw_secret
+        if secret.startswith("whsec_"):
+            secret = secret[len("whsec_"):]
+        try:
+            key = base64.b64decode(secret)
+        except Exception:
+            continue
+        computed = base64.b64encode(
+            hmac.new(key, signed_content, hashlib.sha256).digest()
+        ).decode()
+        for sig in header_sigs:
+            if hmac.compare_digest(computed, sig):
+                return True, ""
+
+    return False, "signature mismatch"
+
+
+def extract_fathom_attendee(payload: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Pick the external attendee from a Fathom payload. Prefers is_external=True;
+    falls back to any invitee whose email != recorded_by email.
+    Returns (name, email) or (None, None) if internal-only.
+    """
+    invitees = payload.get("calendar_invitees", []) or []
+    recorded = (payload.get("recorded_by", {}) or {}).get("email", "") or ""
+    recorded_lower = recorded.strip().lower()
+
+    # Pass 1: explicit is_external=True
+    for inv in invitees:
+        if inv.get("is_external") is True:
+            email = (inv.get("email") or "").strip()
+            if email:
+                return (inv.get("name") or "").strip(), email
+
+    # Pass 2: any invitee whose email isn't the host
+    for inv in invitees:
+        email = (inv.get("email") or "").strip()
+        if email and email.lower() != recorded_lower:
+            return (inv.get("name") or "").strip(), email
+
+    return None, None
+
+
+def fathom_share_url_already_in_unmatched(share_url: str) -> bool:
+    """Return True if the given share_url already exists in the 'Unmatched Fathom' tab."""
+    rows = sheets_read_all(tab="Unmatched Fathom", range_str="A:C")
+    for i, row in enumerate(rows):
+        if i == 0:  # header
+            continue
+        if len(row) > 2 and row[2].strip() == share_url:
+            return True
+    return False
+
+
+def fathom_sales_call_recording_value(row_number: int) -> str:
+    """Return the current value of column S (Fathom Recording) for a given Sales Calls row."""
+    service = get_sheets_service()
+    if not service:
+        return ""
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'Sales Calls'!S{row_number}",
+            )
+            .execute()
+        )
+        values = result.get("values", [])
+        if values and values[0]:
+            return str(values[0][0]).strip()
+        return ""
+    except Exception as e:
+        logger.warning(f"Could not read S{row_number}: {e}")
+        return ""
 
 # ─── Event Handlers ───────────────────────────────────────────
 
@@ -1075,6 +1201,85 @@ async def stripe_webhook(request: Request):
         handle_stripe_payment(event)
 
     return JSONResponse(content={"status": "success"}, status_code=200)
+
+
+@app.post("/fathom-webhook")
+async def fathom_webhook(request: Request):
+    """
+    Receive a Fathom call-recording webhook, match the attendee email to a
+    Sales Calls row and write the share_url to column S. If no match, append
+    to the 'Unmatched Fathom' tab. Transcript + summary always logged to the
+    'Fathom Logs' tab for later analysis.
+    """
+    raw_body = await request.body()
+
+    if not _fathom_secrets():
+        logger.error("FATHOM_WEBHOOK_SECRETS is not set — cannot verify Fathom webhooks")
+        return JSONResponse(content={"error": "Webhook secrets not configured"}, status_code=500)
+
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    ok, reason = verify_fathom_signature(headers, raw_body)
+    if not ok:
+        logger.error(f"Fathom signature verification failed: {reason}")
+        return JSONResponse(content={"error": "Invalid signature"}, status_code=400)
+
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        logger.error("Fathom webhook: invalid JSON body")
+        return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
+
+    title     = (payload.get("title") or "").strip()
+    share_url = (payload.get("share_url") or "").strip()
+    if not share_url:
+        logger.warning("Fathom webhook missing share_url — skipping")
+        return JSONResponse(content={"status": "ok", "detail": "no share_url"}, status_code=200)
+
+    name, email = extract_fathom_attendee(payload)
+    if not email:
+        logger.info(f"Fathom: no external attendee, skipping (title={title!r})")
+        return JSONResponse(content={"status": "ok", "detail": "internal-only meeting"}, status_code=200)
+
+    # Always log transcript + summary to the Fathom Logs tab
+    transcript_raw = payload.get("transcript", "")
+    if isinstance(transcript_raw, list):
+        transcript_text = json.dumps(transcript_raw, default=str)
+    else:
+        transcript_text = str(transcript_raw or "")
+    if len(transcript_text) > 45000:
+        transcript_text = transcript_text[:45000] + "…[truncated]"
+
+    summary_raw = payload.get("default_summary", "")
+    if isinstance(summary_raw, (dict, list)):
+        summary_text = json.dumps(summary_raw, default=str)
+    else:
+        summary_text = str(summary_raw or "")
+
+    timestamp = datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S")
+    sheets_append_row(
+        [timestamp, email, share_url, title, summary_text, transcript_text],
+        tab="Fathom Logs",
+    )
+
+    # Try to match email against Sales Calls
+    row_num = find_row_by_email(email, tab="Sales Calls")
+    if row_num:
+        existing = fathom_sales_call_recording_value(row_num)
+        if existing:
+            logger.info(
+                f"Fathom: Sales Calls S{row_num} already has '{existing}' for {email} — not overwriting"
+            )
+        else:
+            sheets_update_cell(row_num, "S", share_url, tab="Sales Calls")
+            logger.info(f"Fathom: wrote {share_url} to Sales Calls S{row_num} for {email}")
+    else:
+        if fathom_share_url_already_in_unmatched(share_url):
+            logger.info(f"Fathom: share_url {share_url} already in Unmatched Fathom — not duplicating")
+        else:
+            sheets_append_row([name or "", email, share_url], tab="Unmatched Fathom")
+            logger.info(f"Fathom: no match for {email}, appended to Unmatched Fathom")
+
+    return JSONResponse(content={"status": "ok"}, status_code=200)
 
 
 @app.post("/triage-booked")
@@ -1778,23 +1983,26 @@ async def health():
     ghl_configured            = bool(GHL_TOKEN)
     stripe_configured         = bool(STRIPE_API_KEY)
     stripe_webhook_configured = bool(STRIPE_WEBHOOK_SECRET)
+    fathom_secrets_count      = len(_fathom_secrets())
     return {
         "status": "healthy",
         "timestamp": datetime.now(AEST).isoformat(),
-        "google_sheets_auth":    "configured" if sa_configured             else "MISSING — set GOOGLE_SERVICE_ACCOUNT_JSON",
-        "ghl_token":             "configured" if ghl_configured            else "MISSING — set GHL_TOKEN",
-        "stripe_api_key":        "configured" if stripe_configured         else "MISSING — set STRIPE_API_KEY",
-        "stripe_webhook_secret": "configured" if stripe_webhook_configured else "MISSING — set STRIPE_WEBHOOK_SECRET",
+        "google_sheets_auth":     "configured" if sa_configured             else "MISSING — set GOOGLE_SERVICE_ACCOUNT_JSON",
+        "ghl_token":              "configured" if ghl_configured            else "MISSING — set GHL_TOKEN",
+        "stripe_api_key":         "configured" if stripe_configured         else "MISSING — set STRIPE_API_KEY",
+        "stripe_webhook_secret":  "configured" if stripe_webhook_configured else "MISSING — set STRIPE_WEBHOOK_SECRET",
+        "fathom_webhook_secrets": f"{fathom_secrets_count} configured"      if fathom_secrets_count    else "MISSING — set FATHOM_WEBHOOK_SECRETS",
     }
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "GHL + Stripe Webhook Receiver",
-        "version": "1.6.0",
+        "service": "GHL + Stripe + Fathom Webhook Receiver",
+        "version": "1.7.0",
         "ghl_webhook_endpoint": "POST /webhook",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
+        "fathom_webhook_endpoint": "POST /fathom-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
         "triage_cancelled_endpoint": "POST /triage-cancelled",
         "triage_lost_endpoint": "POST /triage-lost",
