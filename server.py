@@ -64,6 +64,7 @@ ZOOM_ACCOUNT_ID       = os.environ.get("ZOOM_ACCOUNT_ID",       "")
 ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
 ZOOM_CLIENT_SECRET    = os.environ.get("ZOOM_CLIENT_SECRET",    "")
 ZOOM_WEBINAR_ID       = os.environ.get("ZOOM_WEBINAR_ID",       "")
+ZOOM_WEBINAR_ID_USA   = os.environ.get("ZOOM_WEBINAR_ID_USA",   "")
 
 # Fathom (one or more signing secrets, comma-separated)
 FATHOM_WEBHOOK_SECRETS_RAW = os.environ.get("FATHOM_WEBHOOK_SECRETS", "")
@@ -1777,14 +1778,15 @@ def get_zoom_access_token() -> str:
     return token
 
 
-def register_zoom_webinar(first_name: str, last_name: str, email: str) -> dict:
+def register_zoom_webinar(first_name: str, last_name: str, email: str, webinar_id: str = "") -> dict:
     """
-    Register a person for the Zoom webinar specified by ZOOM_WEBINAR_ID.
+    Register a person for the Zoom webinar specified by webinar_id (or ZOOM_WEBINAR_ID fallback).
     Returns the full Zoom API response dict (contains join_url, etc.).
     Raises RuntimeError on failure.
     """
+    wid = webinar_id or ZOOM_WEBINAR_ID
     token = get_zoom_access_token()
-    url = f"https://api.zoom.us/v2/webinars/{ZOOM_WEBINAR_ID}/registrants"
+    url = f"https://api.zoom.us/v2/webinars/{wid}/registrants"
     payload = {
         "first_name": first_name,
         "last_name": last_name,
@@ -1794,7 +1796,7 @@ def register_zoom_webinar(first_name: str, last_name: str, email: str) -> dict:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    logger.info(f"Registering {email} for Zoom webinar {ZOOM_WEBINAR_ID}")
+    logger.info(f"Registering {email} for Zoom webinar {wid}")
     try:
         resp = http_requests.post(url, json=payload, headers=headers, timeout=15)
         resp.raise_for_status()
@@ -1977,6 +1979,111 @@ async def zoom_register(request: Request):
     )
 
 
+@app.post("/zoom-register-usa")
+async def zoom_register_usa(request: Request):
+    """Same as /zoom-register but uses ZOOM_WEBINAR_ID_USA for the USA webinar."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logger.info("[zoom-register-usa] Received webhook request")
+
+    first_name = extract_field(
+        body,
+        "first_name", "firstName", "first_Name", "fname",
+        "contact_first_name", "contact.first_name",
+        "full_name",
+    )
+    last_name = extract_field(
+        body,
+        "last_name", "lastName", "last_Name", "lname",
+        "contact_last_name", "contact.last_name",
+    )
+    email = extract_field(
+        body,
+        "email", "Email", "contact_email", "contact.email",
+    )
+    contact_id = extract_field(
+        body,
+        "contact_id", "contactId", "contact.id", "id",
+    )
+
+    if first_name and not last_name and " " in first_name:
+        parts = first_name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1]
+
+    contact_obj = body.get("contact", {}) or {}
+    if not first_name:
+        first_name = contact_obj.get("firstName", "") or contact_obj.get("first_name", "")
+    if not last_name:
+        last_name = contact_obj.get("lastName", "") or contact_obj.get("last_name", "")
+    if not email:
+        email = contact_obj.get("email", "")
+    if not contact_id:
+        contact_id = contact_obj.get("id", "")
+
+    missing = []
+    if not first_name:
+        missing.append("first_name")
+    if not email:
+        missing.append("email")
+    if not contact_id:
+        missing.append("contact_id")
+    if missing:
+        msg = f"Missing required fields: {', '.join(missing)}"
+        logger.warning(f"[zoom-register-usa] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=400)
+
+    logger.info(
+        f"[zoom-register-usa] Registering: {first_name} {last_name} <{email}> "
+        f"(contact_id={contact_id})"
+    )
+
+    if not ZOOM_WEBINAR_ID_USA:
+        msg = "ZOOM_WEBINAR_ID_USA environment variable is not set"
+        logger.error(f"[zoom-register-usa] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=500)
+
+    try:
+        zoom_resp = register_zoom_webinar(first_name, last_name, email, webinar_id=ZOOM_WEBINAR_ID_USA)
+    except RuntimeError as exc:
+        return JSONResponse(
+            content={"status": "error", "detail": str(exc)},
+            status_code=502,
+        )
+
+    join_url = zoom_resp.get("join_url", "")
+    if not join_url:
+        msg = f"Zoom API did not return a join_url. Response: {zoom_resp}"
+        logger.error(f"[zoom-register-usa] {msg}")
+        return JSONResponse(content={"status": "error", "detail": msg}, status_code=502)
+
+    logger.info(f"[zoom-register-usa] Got join_url for {email}: {join_url}")
+
+    try:
+        update_ghl_contact_zoom_link(contact_id, join_url)
+    except RuntimeError as exc:
+        return JSONResponse(
+            content={
+                "status": "partial",
+                "detail": f"Zoom registration succeeded but GHL update failed: {exc}",
+                "join_url": join_url,
+            },
+            status_code=207,
+        )
+
+    logger.info(f"[zoom-register-usa] Completed successfully for {email}")
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "email": email,
+            "join_url": join_url,
+        },
+        status_code=200,
+    )
+
+
 @app.get("/health")
 async def health():
     sa_configured             = bool(GOOGLE_SA_JSON)
@@ -1999,8 +2106,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe + Fathom Webhook Receiver",
-        "version": "1.7.0",
-        "ghl_webhook_endpoint": "POST /webhook",
+        "version": "1.7.1",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "fathom_webhook_endpoint": "POST /fathom-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
@@ -2009,6 +2115,7 @@ async def root():
         "triage_status_endpoint": "POST /triage-status",
         "triage_pipeline_endpoint": "POST /triage-pipeline",
         "zoom_register_endpoint": "POST /zoom-register",
+        "zoom_register_usa_endpoint": "POST /zoom-register-usa",
         "health_endpoint": "GET /health",
     }
 
