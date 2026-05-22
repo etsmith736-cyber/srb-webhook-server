@@ -429,6 +429,41 @@ def sheets_update_range(row_number: int, start_col: str, values: list, tab: str 
         logger.error(f"Failed to update range {start_col}{row_number}:{end_col}{row_number}: {e}")
 
 
+def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls") -> tuple[bool, str]:
+    """
+    Write multiple ranges to the same tab in a single API call.
+    updates: list of {'range': 'U10:X10', 'values': [['a','b','c','d']]}
+    Returns (success, error_message).
+    """
+    service = get_sheets_service()
+    if not service:
+        return False, "Sheets service unavailable"
+    if not updates:
+        return True, ""
+    data = []
+    for u in updates:
+        data.append({
+            "range": f"'{tab}'!{u['range']}",
+            "values": u["values"],
+        })
+    try:
+        result = service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
+        total = result.get("totalUpdatedCells", 0)
+        logger.info(f"Batch updated {len(data)} ranges in {tab}: {total} cells written")
+        return True, ""
+    except HttpError as e:
+        msg = f"Batch update HttpError for {tab}: {e}"
+        logger.error(msg)
+        return False, str(e)[:300]
+    except Exception as e:
+        msg = f"Batch update failed for {tab}: {e}"
+        logger.error(msg)
+        return False, str(e)[:300]
+
+
 def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
     """Highlight an entire row in the Sales Calls tab with the specified RGB color."""
     service = get_sheets_service()
@@ -2232,11 +2267,15 @@ async def backfill_attribution(request: Request):
         "rows_no_email": 0,
         "rows_no_ghl_match": 0,
         "rows_no_attribution_data": 0,
+        "write_success": None,
+        "write_error": "",
         "details": [],
     }
 
     # 0-based column index of target_start_col, for reading current sheet values
     target_start_idx = ord(target_start_col) - ord("A")
+    end_col_letter = chr(ord(target_start_col) + 3)  # 4 columns: U..X or O..R
+    pending_writes = []
 
     for row_num in range(start_row, end_row + 1):
         row_idx = row_num - 1
@@ -2281,11 +2320,10 @@ async def backfill_attribution(request: Request):
             continue
 
         if not dry_run:
-            sheets_update_range(
-                row_num, target_start_col,
-                [ft_campaign, ft_ad, lt_campaign, lt_ad],
-                tab=tab,
-            )
+            pending_writes.append({
+                "range": f"{target_start_col}{row_num}:{end_col_letter}{row_num}",
+                "values": [[ft_campaign, ft_ad, lt_campaign, lt_ad]],
+            })
 
         entry = {
             "row": row_num,
@@ -2302,6 +2340,12 @@ async def backfill_attribution(request: Request):
             entry["last_attribution_raw"]  = last_attr
         summary["rows_filled"] += 1
         summary["details"].append(entry)
+
+    # Single batched write for the whole chunk — avoids hitting Google's per-minute write limit
+    if not dry_run and pending_writes:
+        ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
+        summary["write_success"] = ok
+        summary["write_error"] = err
 
     return JSONResponse(summary)
 
