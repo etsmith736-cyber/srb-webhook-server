@@ -265,6 +265,39 @@ def get_cf_value(contact: dict, field_id: str) -> str:
             return str(cf.get("value", "")).strip()
     return ""
 
+
+def ghl_find_contact_by_email(email: str) -> dict:
+    """
+    Find a GHL contact by exact email using the duplicate-detection endpoint.
+    Returns {} if not found or on error.
+    """
+    if not GHL_TOKEN or not email:
+        return {}
+    email_clean = email.strip().lower()
+    try:
+        r = http_requests.get(
+            f"{GHL_BASE_URL}/contacts/search/duplicate",
+            params={"locationId": GHL_LOCATION_ID, "email": email_clean},
+            headers={
+                "Authorization": f"Bearer {GHL_TOKEN}",
+                "Version": "2021-07-28",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json() or {}
+            contact = data.get("contact") or {}
+            if contact:
+                return contact
+        elif r.status_code == 404:
+            return {}
+        else:
+            logger.warning(f"GHL duplicate-search returned {r.status_code} for {email_clean}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"GHL duplicate-search failed for {email_clean}: {e}")
+    return {}
+
 # ─── Google Sheets Helpers ────────────────────────────────────
 
 def sheets_read_all(tab: str = "Sales Calls", range_str: str = "A:R") -> list[list[str]]:
@@ -368,6 +401,27 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = 
         logger.error(f"Sheets cell update error for {tab}: {e}")
     except Exception as e:
         logger.error(f"Failed to update cell {col_letter}{row_number} in {tab}: {e}")
+
+
+def sheets_update_range(row_number: int, start_col: str, values: list, tab: str = "Sales Calls"):
+    """Update a contiguous horizontal range of cells in a single row with one API call."""
+    service = get_sheets_service()
+    if not service:
+        logger.error("Cannot update range — Sheets service unavailable")
+        return
+    end_col = chr(ord(start_col) + len(values) - 1)
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{tab}'!{start_col}{row_number}:{end_col}{row_number}",
+            valueInputOption="RAW",
+            body={"values": [values]},
+        ).execute()
+        logger.info(f"Range {start_col}{row_number}:{end_col}{row_number} updated in {tab}")
+    except HttpError as e:
+        logger.error(f"Sheets range update error for {tab}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to update range {start_col}{row_number}:{end_col}{row_number}: {e}")
 
 
 def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
@@ -2082,6 +2136,158 @@ async def zoom_register_usa(request: Request):
         },
         status_code=200,
     )
+
+# ─── Admin / Backfill Endpoints ───────────────────────────────
+
+def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
+    """Extract (campaign, ad/content) from a GHL attribution-source object,
+    trying multiple field-name conventions."""
+    if not attribution or not isinstance(attribution, dict):
+        return "", ""
+    campaign = (
+        attribution.get("utmCampaign")
+        or attribution.get("utm_campaign")
+        or attribution.get("campaign")
+        or ""
+    )
+    content = (
+        attribution.get("utmContent")
+        or attribution.get("utm_content")
+        or attribution.get("content")
+        or ""
+    )
+    return str(campaign or "").strip(), str(content or "").strip()
+
+
+@app.post("/admin/backfill-attribution")
+async def backfill_attribution(request: Request):
+    """
+    Backfill First/Last Touch Campaign/Ad columns by looking up each row's email
+    in GHL and pulling its first + last attribution.
+
+    Query params:
+      tab        — "Sales Calls" (default) or "Triage Calls"
+      start_row  — int, 1-based, default 2
+      end_row    — int, 1-based, default = last row of sheet
+      last_n     — int, shortcut: process only the last N data rows (overrides start/end)
+      dry_run    — "true" (default) or "false". When true, no writes happen.
+      verbose    — "true" or "false" (default). When true, include raw GHL attribution
+                   objects in the response for debugging.
+    """
+    params = dict(request.query_params)
+    tab        = params.get("tab", "Sales Calls")
+    dry_run    = params.get("dry_run", "true").lower() != "false"
+    verbose    = params.get("verbose", "false").lower() == "true"
+
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    if tab == "Sales Calls":
+        target_start_col = "U"
+        email_col_idx    = COL["Email"]
+        range_str        = "A:X"
+    elif tab == "Triage Calls":
+        target_start_col = "O"
+        email_col_idx    = TRIAGE_COL["Email"]
+        range_str        = "A:R"
+    else:
+        return JSONResponse({"error": f"Unknown tab: {tab!r}"}, status_code=400)
+
+    all_rows = sheets_read_all(tab=tab, range_str=range_str)
+    if not all_rows:
+        return JSONResponse({"error": f"Could not read tab {tab!r}"}, status_code=500)
+
+    total_rows = len(all_rows)  # includes header
+
+    if "last_n" in params:
+        try:
+            n = int(params["last_n"])
+        except ValueError:
+            return JSONResponse({"error": "last_n must be an integer"}, status_code=400)
+        start_row = max(2, total_rows - n + 1)
+        end_row   = total_rows
+    else:
+        try:
+            start_row = int(params.get("start_row", "2"))
+            end_row   = int(params.get("end_row", str(total_rows)))
+        except ValueError:
+            return JSONResponse({"error": "start_row / end_row must be integers"}, status_code=400)
+        start_row = max(2, start_row)
+        end_row   = min(end_row, total_rows)
+
+    summary = {
+        "tab": tab,
+        "start_row": start_row,
+        "end_row": end_row,
+        "dry_run": dry_run,
+        "total_rows_in_sheet": total_rows,
+        "rows_processed": 0,
+        "rows_filled": 0,
+        "rows_no_email": 0,
+        "rows_no_ghl_match": 0,
+        "rows_no_attribution_data": 0,
+        "details": [],
+    }
+
+    for row_num in range(start_row, end_row + 1):
+        row_idx = row_num - 1
+        row = all_rows[row_idx] if row_idx < len(all_rows) else []
+
+        email = ""
+        if len(row) > email_col_idx:
+            email = str(row[email_col_idx] or "").strip()
+
+        summary["rows_processed"] += 1
+
+        if not email:
+            summary["rows_no_email"] += 1
+            summary["details"].append({"row": row_num, "status": "no_email"})
+            continue
+
+        contact = ghl_find_contact_by_email(email)
+        if not contact:
+            summary["rows_no_ghl_match"] += 1
+            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match"})
+            continue
+
+        first_attr = contact.get("attributionSource", {}) or {}
+        last_attr  = contact.get("lastAttributionSource", {}) or {}
+
+        ft_campaign, ft_ad = _extract_attribution_fields(first_attr)
+        lt_campaign, lt_ad = _extract_attribution_fields(last_attr)
+
+        if not any([ft_campaign, ft_ad, lt_campaign, lt_ad]):
+            entry = {"row": row_num, "email": email, "status": "no_attribution_data"}
+            if verbose:
+                entry["first_attribution_raw"] = first_attr
+                entry["last_attribution_raw"]  = last_attr
+            summary["rows_no_attribution_data"] += 1
+            summary["details"].append(entry)
+            continue
+
+        if not dry_run:
+            sheets_update_range(
+                row_num, target_start_col,
+                [ft_campaign, ft_ad, lt_campaign, lt_ad],
+                tab=tab,
+            )
+
+        entry = {
+            "row": row_num,
+            "email": email,
+            "status": "ok",
+            "ft_campaign": ft_campaign,
+            "ft_ad": ft_ad,
+            "lt_campaign": lt_campaign,
+            "lt_ad": lt_ad,
+        }
+        if verbose:
+            entry["first_attribution_raw"] = first_attr
+            entry["last_attribution_raw"]  = last_attr
+        summary["rows_filled"] += 1
+        summary["details"].append(entry)
+
+    return JSONResponse(summary)
 
 
 @app.get("/health")
