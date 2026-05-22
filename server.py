@@ -2146,7 +2146,8 @@ async def zoom_register_usa(request: Request):
 
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
     """Extract (campaign, ad/content) from a GHL attribution-source object,
-    trying multiple field-name conventions."""
+    trying multiple field-name conventions. Returns values normalized to
+    UPPERCASE so the same campaign/ad with different casing is treated as one."""
     if not attribution or not isinstance(attribution, dict):
         return "", ""
     campaign = (
@@ -2161,7 +2162,7 @@ def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
         or attribution.get("content")
         or ""
     )
-    return str(campaign or "").strip(), str(content or "").strip()
+    return str(campaign or "").strip().upper(), str(content or "").strip().upper()
 
 
 @app.post("/admin/backfill-attribution")
