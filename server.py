@@ -268,12 +268,15 @@ def get_cf_value(contact: dict, field_id: str) -> str:
 
 def ghl_find_contact_by_email(email: str) -> dict:
     """
-    Find a GHL contact by exact email using the duplicate-detection endpoint.
+    Find a GHL contact by exact email. The duplicate-detection endpoint only
+    returns a stripped-down contact object (no attribution), so we use it to
+    locate the contact ID and then fetch the full contact via /contacts/{id}.
     Returns {} if not found or on error.
     """
     if not GHL_TOKEN or not email:
         return {}
     email_clean = email.strip().lower()
+    contact_id = ""
     try:
         r = http_requests.get(
             f"{GHL_BASE_URL}/contacts/search/duplicate",
@@ -287,16 +290,18 @@ def ghl_find_contact_by_email(email: str) -> dict:
         )
         if r.status_code == 200:
             data = r.json() or {}
-            contact = data.get("contact") or {}
-            if contact:
-                return contact
-        elif r.status_code == 404:
-            return {}
-        else:
+            contact_stub = data.get("contact") or {}
+            contact_id = contact_stub.get("id", "")
+        elif r.status_code != 404:
             logger.warning(f"GHL duplicate-search returned {r.status_code} for {email_clean}: {r.text[:200]}")
     except Exception as e:
         logger.warning(f"GHL duplicate-search failed for {email_clean}: {e}")
-    return {}
+
+    if not contact_id:
+        return {}
+
+    # Now fetch the full contact (which includes attributionSource / lastAttributionSource)
+    return ghl_get_contact(contact_id)
 
 # ─── Google Sheets Helpers ────────────────────────────────────
 
