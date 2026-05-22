@@ -1315,7 +1315,22 @@ async def fathom_webhook(request: Request):
     headers = {k.lower(): v for k, v in request.headers.items()}
     ok, reason = verify_fathom_signature(headers, raw_body)
     if not ok:
-        logger.error(f"Fathom signature verification failed: {reason}")
+        # Best-effort: peek at the (unverified) payload to log who recorded the meeting.
+        # We don't ACT on the payload — just log enough info to identify which Fathom
+        # account is sending the un-verifiable events.
+        recorded_by_email = ""
+        title_for_debug = ""
+        webhook_id = headers.get("webhook-id", "")
+        try:
+            peek = json.loads(raw_body)
+            recorded_by_email = ((peek.get("recorded_by") or {}).get("email") or "").strip()
+            title_for_debug = (peek.get("title") or "").strip()
+        except Exception:
+            pass
+        logger.error(
+            f"Fathom signature verification failed: {reason} | "
+            f"recorded_by={recorded_by_email!r} title={title_for_debug!r} webhook_id={webhook_id!r}"
+        )
         return JSONResponse(content={"error": "Invalid signature"}, status_code=400)
 
     try:
