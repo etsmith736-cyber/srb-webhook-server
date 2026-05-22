@@ -2235,6 +2235,9 @@ async def backfill_attribution(request: Request):
         "details": [],
     }
 
+    # 0-based column index of target_start_col, for reading current sheet values
+    target_start_idx = ord(target_start_col) - ord("A")
+
     for row_num in range(start_row, end_row + 1):
         row_idx = row_num - 1
         row = all_rows[row_idx] if row_idx < len(all_rows) else []
@@ -2243,17 +2246,23 @@ async def backfill_attribution(request: Request):
         if len(row) > email_col_idx:
             email = str(row[email_col_idx] or "").strip()
 
+        # Capture what's currently in the target cells (for diagnostics)
+        current_in_sheet = []
+        for off in range(4):
+            idx = target_start_idx + off
+            current_in_sheet.append(str(row[idx]).strip() if len(row) > idx else "")
+
         summary["rows_processed"] += 1
 
         if not email:
             summary["rows_no_email"] += 1
-            summary["details"].append({"row": row_num, "status": "no_email"})
+            summary["details"].append({"row": row_num, "status": "no_email", "current_in_sheet": current_in_sheet})
             continue
 
         contact = ghl_find_contact_by_email(email)
         if not contact:
             summary["rows_no_ghl_match"] += 1
-            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match"})
+            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match", "current_in_sheet": current_in_sheet})
             continue
 
         first_attr = contact.get("attributionSource", {}) or {}
@@ -2263,7 +2272,7 @@ async def backfill_attribution(request: Request):
         lt_campaign, lt_ad = _extract_attribution_fields(last_attr)
 
         if not any([ft_campaign, ft_ad, lt_campaign, lt_ad]):
-            entry = {"row": row_num, "email": email, "status": "no_attribution_data"}
+            entry = {"row": row_num, "email": email, "status": "no_attribution_data", "current_in_sheet": current_in_sheet}
             if verbose:
                 entry["first_attribution_raw"] = first_attr
                 entry["last_attribution_raw"]  = last_attr
@@ -2287,6 +2296,7 @@ async def backfill_attribution(request: Request):
             "lt_campaign": lt_campaign,
             "lt_ad": lt_ad,
         }
+        entry["current_in_sheet"] = current_in_sheet
         if verbose:
             entry["first_attribution_raw"] = first_attr
             entry["last_attribution_raw"]  = last_attr
