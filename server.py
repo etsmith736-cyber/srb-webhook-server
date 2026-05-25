@@ -508,8 +508,27 @@ def sheets_highlight_row(row_number: int, red: float, green: float, blue: float)
 # ─── Fathom Helpers ───────────────────────────────────────────
 
 def _fathom_secrets() -> list[str]:
-    """Return the list of configured Fathom webhook signing secrets."""
-    return [s.strip() for s in FATHOM_WEBHOOK_SECRETS_RAW.split(",") if s.strip()]
+    """Return all configured Fathom webhook signing secrets.
+
+    Supports two formats simultaneously:
+      1. FATHOM_WEBHOOK_SECRETS — single env var, comma-separated (legacy)
+      2. FATHOM_WEBHOOK_SECRET_*  — individual env vars per Fathom account,
+         e.g. FATHOM_WEBHOOK_SECRET_SOFIA, FATHOM_WEBHOOK_SECRET_CLAUDIA,
+         or FATHOM_WEBHOOK_SECRET_1, FATHOM_WEBHOOK_SECRET_2 — anything
+         after the underscore is fine.
+    """
+    secrets: list[str] = []
+    raw_combined = os.environ.get("FATHOM_WEBHOOK_SECRETS", "")
+    for s in raw_combined.split(","):
+        s = s.strip()
+        if s:
+            secrets.append(s)
+    for key, val in os.environ.items():
+        if key.startswith("FATHOM_WEBHOOK_SECRET_"):
+            s = (val or "").strip()
+            if s:
+                secrets.append(s)
+    return secrets
 
 
 def verify_fathom_signature(headers: dict, raw_body: bytes) -> tuple[bool, str]:
