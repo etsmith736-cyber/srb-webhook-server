@@ -859,6 +859,7 @@ def handle_appointment_created(body: dict):
     )
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
 
+    contact = None
     # Fallback to GHL API if email is missing
     if not email and contact_id:
         logger.info(f"Email not in payload — falling back to GHL API for contact {contact_id}")
@@ -876,6 +877,20 @@ def handle_appointment_created(body: dict):
     if not email:
         logger.warning("No email found in payload or GHL API — skipping")
         return
+
+    # Fetch full GHL contact (with attribution) if we don't already have it,
+    # so we can populate First/Last Touch Campaign/Ad in columns U–X.
+    if contact is None:
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+        else:
+            contact = ghl_find_contact_by_email(email)
+
+    ft_campaign, ft_ad = "", ""
+    lt_campaign, lt_ad = "", ""
+    if contact:
+        ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
+        lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
 
     now_aest    = datetime.now(AEST)
     date_booked = now_aest.strftime("%Y-%m-%d")
@@ -962,9 +977,28 @@ def handle_appointment_created(body: dict):
                 if idx < len(old) and old[idx].strip():
                     row[idx] = old[idx]
         sheets_update_row(existing_row, row)
+        target_row = existing_row
     else:
         logger.info(f"New contact {email} — appending row")
         sheets_append_row(row)
+        target_row = find_row_by_email(email)
+
+    # Write First/Last Touch Campaign + Ad to U:X if GHL had attribution data.
+    # If GHL has nothing, leave U:X alone (preserves any existing values on reschedule;
+    # leaves blank on new appends — matches user-chosen "skip" behaviour).
+    if target_row and any([ft_campaign, ft_ad, lt_campaign, lt_ad]):
+        sheets_update_range(
+            target_row, "U",
+            [ft_campaign, ft_ad, lt_campaign, lt_ad],
+            tab="Sales Calls",
+        )
+        logger.info(
+            f"Wrote attribution to Sales Calls U{target_row}:X{target_row} for {email}"
+        )
+    elif target_row:
+        logger.info(
+            f"No GHL attribution available for {email} — leaving U:X blank/unchanged"
+        )
 
 
 def handle_appointment_status(body: dict):
