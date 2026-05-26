@@ -888,11 +888,13 @@ def handle_appointment_created(body: dict):
 
     ft_campaign, ft_ad = "", ""
     lt_campaign, lt_ad = "", ""
-    country = ""
     if contact:
         ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
         lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
-        country = _extract_country(contact)
+
+    # Country is derived from phone country code prefix (more reliable than
+    # GHL's country field, which defaults to the location's country).
+    country = _country_from_phone(phone)
 
     now_aest    = datetime.now(AEST)
     date_booked = now_aest.strftime("%Y-%m-%d")
@@ -2256,35 +2258,63 @@ async def zoom_register_usa(request: Request):
 
 # ─── Admin / Backfill Endpoints ───────────────────────────────
 
-COUNTRY_NAMES = {
-    "AU": "Australia", "NZ": "New Zealand", "GB": "United Kingdom", "UK": "United Kingdom",
-    "US": "United States", "CA": "Canada", "IE": "Ireland", "ZA": "South Africa",
-    "SG": "Singapore", "AE": "United Arab Emirates", "DE": "Germany", "FR": "France",
-    "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "BE": "Belgium", "CH": "Switzerland",
-    "SE": "Sweden", "NO": "Norway", "DK": "Denmark", "FI": "Finland", "AT": "Austria",
-    "PT": "Portugal", "PL": "Poland", "IN": "India", "JP": "Japan", "HK": "Hong Kong",
-    "MY": "Malaysia", "PH": "Philippines", "TH": "Thailand", "ID": "Indonesia",
-    "MX": "Mexico", "BR": "Brazil", "AR": "Argentina", "CL": "Chile", "CO": "Colombia",
-    "FJ": "Fiji", "PG": "Papua New Guinea",
+# Map phone country-code prefix → country name. Order matters because some
+# codes are sub-prefixes of others — we try longer prefixes first in
+# _country_from_phone, so this dict can be in any order.
+PHONE_CODE_TO_COUNTRY = {
+    "1":   "United States",   # also Canada — defaulting to US since that's the relevant new market
+    "27":  "South Africa",
+    "31":  "Netherlands",
+    "32":  "Belgium",
+    "33":  "France",
+    "34":  "Spain",
+    "39":  "Italy",
+    "41":  "Switzerland",
+    "43":  "Austria",
+    "44":  "United Kingdom",
+    "45":  "Denmark",
+    "46":  "Sweden",
+    "47":  "Norway",
+    "48":  "Poland",
+    "49":  "Germany",
+    "52":  "Mexico",
+    "54":  "Argentina",
+    "55":  "Brazil",
+    "56":  "Chile",
+    "57":  "Colombia",
+    "60":  "Malaysia",
+    "61":  "Australia",
+    "62":  "Indonesia",
+    "63":  "Philippines",
+    "64":  "New Zealand",
+    "65":  "Singapore",
+    "66":  "Thailand",
+    "81":  "Japan",
+    "86":  "China",
+    "91":  "India",
+    "351": "Portugal",
+    "353": "Ireland",
+    "358": "Finland",
+    "679": "Fiji",
+    "852": "Hong Kong",
+    "971": "United Arab Emirates",
 }
 
 
-def _extract_country(contact: dict) -> str:
-    """Pull the country from a GHL contact and map ISO code → full name.
-    Falls back to the raw code if not in the mapping."""
-    if not contact or not isinstance(contact, dict):
+def _country_from_phone(phone: str) -> str:
+    """Determine country from a phone number's international dialling prefix.
+    Handles +, spaces, dashes, brackets. Returns '' if no prefix matches."""
+    if not phone:
         return ""
-    raw = (
-        contact.get("country")
-        or (contact.get("address") or {}).get("country")
-        or contact.get("contactCountry")
-        or ""
-    )
-    raw = str(raw or "").strip()
-    if not raw:
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    if not digits:
         return ""
-    code = raw.upper()
-    return COUNTRY_NAMES.get(code, raw)
+    # Try longest prefixes first (3-digit), then 2-digit, then 1-digit
+    for length in (3, 2, 1):
+        prefix = digits[:length]
+        if prefix in PHONE_CODE_TO_COUNTRY:
+            return PHONE_CODE_TO_COUNTRY[prefix]
+    return ""
 
 
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
@@ -2461,26 +2491,22 @@ async def backfill_attribution(request: Request):
 @app.post("/admin/backfill-country")
 async def backfill_country(request: Request):
     """
-    Backfill column Y (Country) on Sales Calls by looking up each row's email
-    in GHL and pulling the contact's country field.
+    Backfill column Y (Country) on Sales Calls by deriving the country from
+    the phone number's international prefix (column F). No GHL lookup needed.
 
     Query params:
-      start_row, end_row, last_n, dry_run, verbose — same meaning as
-      /admin/backfill-attribution.
+      start_row, end_row, last_n, dry_run — same as /admin/backfill-attribution.
     """
     params = dict(request.query_params)
     tab     = params.get("tab", "Sales Calls")
     dry_run = params.get("dry_run", "true").lower() != "false"
-    verbose = params.get("verbose", "false").lower() == "true"
-
-    if not GHL_TOKEN:
-        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
 
     if tab != "Sales Calls":
         return JSONResponse({"error": f"Country backfill not wired up for tab {tab!r}"}, status_code=400)
 
     target_col    = "Y"
     email_col_idx = COL["Email"]
+    phone_col_idx = COL["Phone"]
     range_str     = "A:Y"
 
     all_rows = sheets_read_all(tab=tab, range_str=range_str)
@@ -2508,6 +2534,7 @@ async def backfill_country(request: Request):
     summary = {
         "tab": tab,
         "field": "country",
+        "source": "phone_prefix",
         "target_col": target_col,
         "start_row": start_row,
         "end_row": end_row,
@@ -2515,9 +2542,8 @@ async def backfill_country(request: Request):
         "total_rows_in_sheet": total_rows,
         "rows_processed": 0,
         "rows_filled": 0,
-        "rows_no_email": 0,
-        "rows_no_ghl_match": 0,
-        "rows_no_country_data": 0,
+        "rows_no_phone": 0,
+        "rows_unknown_prefix": 0,
         "write_success": None,
         "write_error": "",
         "details": [],
@@ -2529,33 +2555,28 @@ async def backfill_country(request: Request):
     for row_num in range(start_row, end_row + 1):
         row_idx = row_num - 1
         row = all_rows[row_idx] if row_idx < len(all_rows) else []
-        email = ""
-        if len(row) > email_col_idx:
-            email = str(row[email_col_idx] or "").strip()
+        email = str(row[email_col_idx] or "").strip() if len(row) > email_col_idx else ""
+        phone = str(row[phone_col_idx] or "").strip() if len(row) > phone_col_idx else ""
         current_in_sheet = str(row[target_idx]).strip() if len(row) > target_idx else ""
 
         summary["rows_processed"] += 1
 
-        if not email:
-            summary["rows_no_email"] += 1
-            summary["details"].append({"row": row_num, "status": "no_email", "current_in_sheet": current_in_sheet})
+        if not phone:
+            summary["rows_no_phone"] += 1
+            summary["details"].append({
+                "row": row_num, "email": email, "status": "no_phone",
+                "current_in_sheet": current_in_sheet,
+            })
             continue
 
-        contact = ghl_find_contact_by_email(email)
-        if not contact:
-            summary["rows_no_ghl_match"] += 1
-            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match", "current_in_sheet": current_in_sheet})
-            continue
-
-        country = _extract_country(contact)
+        country = _country_from_phone(phone)
 
         if not country:
-            entry = {"row": row_num, "email": email, "status": "no_country_data", "current_in_sheet": current_in_sheet}
-            if verbose:
-                entry["contact_keys"] = sorted(contact.keys())
-                entry["address_keys"] = sorted((contact.get("address") or {}).keys()) if isinstance(contact.get("address"), dict) else []
-            summary["rows_no_country_data"] += 1
-            summary["details"].append(entry)
+            summary["rows_unknown_prefix"] += 1
+            summary["details"].append({
+                "row": row_num, "email": email, "phone": phone,
+                "status": "unknown_prefix", "current_in_sheet": current_in_sheet,
+            })
             continue
 
         if not dry_run:
@@ -2564,15 +2585,15 @@ async def backfill_country(request: Request):
                 "values": [[country]],
             })
 
-        entry = {
+        summary["rows_filled"] += 1
+        summary["details"].append({
             "row": row_num,
             "email": email,
+            "phone": phone,
             "status": "ok",
             "country": country,
             "current_in_sheet": current_in_sheet,
-        }
-        summary["rows_filled"] += 1
-        summary["details"].append(entry)
+        })
 
     if not dry_run and pending_writes:
         ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
