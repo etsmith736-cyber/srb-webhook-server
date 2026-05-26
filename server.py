@@ -2256,8 +2256,22 @@ async def zoom_register_usa(request: Request):
 
 # ─── Admin / Backfill Endpoints ───────────────────────────────
 
+COUNTRY_NAMES = {
+    "AU": "Australia", "NZ": "New Zealand", "GB": "United Kingdom", "UK": "United Kingdom",
+    "US": "United States", "CA": "Canada", "IE": "Ireland", "ZA": "South Africa",
+    "SG": "Singapore", "AE": "United Arab Emirates", "DE": "Germany", "FR": "France",
+    "ES": "Spain", "IT": "Italy", "NL": "Netherlands", "BE": "Belgium", "CH": "Switzerland",
+    "SE": "Sweden", "NO": "Norway", "DK": "Denmark", "FI": "Finland", "AT": "Austria",
+    "PT": "Portugal", "PL": "Poland", "IN": "India", "JP": "Japan", "HK": "Hong Kong",
+    "MY": "Malaysia", "PH": "Philippines", "TH": "Thailand", "ID": "Indonesia",
+    "MX": "Mexico", "BR": "Brazil", "AR": "Argentina", "CL": "Chile", "CO": "Colombia",
+    "FJ": "Fiji", "PG": "Papua New Guinea",
+}
+
+
 def _extract_country(contact: dict) -> str:
-    """Pull the country from a GHL contact, trying common locations."""
+    """Pull the country from a GHL contact and map ISO code → full name.
+    Falls back to the raw code if not in the mapping."""
     if not contact or not isinstance(contact, dict):
         return ""
     raw = (
@@ -2266,7 +2280,11 @@ def _extract_country(contact: dict) -> str:
         or contact.get("contactCountry")
         or ""
     )
-    return str(raw or "").strip()
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    code = raw.upper()
+    return COUNTRY_NAMES.get(code, raw)
 
 
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
