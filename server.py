@@ -888,9 +888,11 @@ def handle_appointment_created(body: dict):
 
     ft_campaign, ft_ad = "", ""
     lt_campaign, lt_ad = "", ""
+    country = ""
     if contact:
         ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
         lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
+        country = _extract_country(contact)
 
     now_aest    = datetime.now(AEST)
     date_booked = now_aest.strftime("%Y-%m-%d")
@@ -999,6 +1001,13 @@ def handle_appointment_created(body: dict):
         logger.info(
             f"No GHL attribution available for {email} — leaving U:X blank/unchanged"
         )
+
+    # Write Country to Y if GHL had country data. Same skip-if-empty rule.
+    if target_row and country:
+        sheets_update_cell(target_row, "Y", country, tab="Sales Calls")
+        logger.info(f"Wrote country '{country}' to Sales Calls Y{target_row} for {email}")
+    elif target_row:
+        logger.info(f"No country in GHL for {email} — leaving Y blank/unchanged")
 
 
 def handle_appointment_status(body: dict):
@@ -2247,6 +2256,19 @@ async def zoom_register_usa(request: Request):
 
 # ─── Admin / Backfill Endpoints ───────────────────────────────
 
+def _extract_country(contact: dict) -> str:
+    """Pull the country from a GHL contact, trying common locations."""
+    if not contact or not isinstance(contact, dict):
+        return ""
+    raw = (
+        contact.get("country")
+        or (contact.get("address") or {}).get("country")
+        or contact.get("contactCountry")
+        or ""
+    )
+    return str(raw or "").strip()
+
+
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
     """Extract (campaign, ad/content) from a GHL attribution-source object,
     trying multiple field-name conventions. Returns values normalized to
@@ -2410,6 +2432,130 @@ async def backfill_attribution(request: Request):
         summary["details"].append(entry)
 
     # Single batched write for the whole chunk — avoids hitting Google's per-minute write limit
+    if not dry_run and pending_writes:
+        ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
+        summary["write_success"] = ok
+        summary["write_error"] = err
+
+    return JSONResponse(summary)
+
+
+@app.post("/admin/backfill-country")
+async def backfill_country(request: Request):
+    """
+    Backfill column Y (Country) on Sales Calls by looking up each row's email
+    in GHL and pulling the contact's country field.
+
+    Query params:
+      start_row, end_row, last_n, dry_run, verbose — same meaning as
+      /admin/backfill-attribution.
+    """
+    params = dict(request.query_params)
+    tab     = params.get("tab", "Sales Calls")
+    dry_run = params.get("dry_run", "true").lower() != "false"
+    verbose = params.get("verbose", "false").lower() == "true"
+
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    if tab != "Sales Calls":
+        return JSONResponse({"error": f"Country backfill not wired up for tab {tab!r}"}, status_code=400)
+
+    target_col    = "Y"
+    email_col_idx = COL["Email"]
+    range_str     = "A:Y"
+
+    all_rows = sheets_read_all(tab=tab, range_str=range_str)
+    if not all_rows:
+        return JSONResponse({"error": f"Could not read tab {tab!r}"}, status_code=500)
+
+    total_rows = len(all_rows)
+
+    if "last_n" in params:
+        try:
+            n = int(params["last_n"])
+        except ValueError:
+            return JSONResponse({"error": "last_n must be an integer"}, status_code=400)
+        start_row = max(2, total_rows - n + 1)
+        end_row   = total_rows
+    else:
+        try:
+            start_row = int(params.get("start_row", "2"))
+            end_row   = int(params.get("end_row", str(total_rows)))
+        except ValueError:
+            return JSONResponse({"error": "start_row / end_row must be integers"}, status_code=400)
+        start_row = max(2, start_row)
+        end_row   = min(end_row, total_rows)
+
+    summary = {
+        "tab": tab,
+        "field": "country",
+        "target_col": target_col,
+        "start_row": start_row,
+        "end_row": end_row,
+        "dry_run": dry_run,
+        "total_rows_in_sheet": total_rows,
+        "rows_processed": 0,
+        "rows_filled": 0,
+        "rows_no_email": 0,
+        "rows_no_ghl_match": 0,
+        "rows_no_country_data": 0,
+        "write_success": None,
+        "write_error": "",
+        "details": [],
+    }
+
+    target_idx = ord(target_col) - ord("A")
+    pending_writes = []
+
+    for row_num in range(start_row, end_row + 1):
+        row_idx = row_num - 1
+        row = all_rows[row_idx] if row_idx < len(all_rows) else []
+        email = ""
+        if len(row) > email_col_idx:
+            email = str(row[email_col_idx] or "").strip()
+        current_in_sheet = str(row[target_idx]).strip() if len(row) > target_idx else ""
+
+        summary["rows_processed"] += 1
+
+        if not email:
+            summary["rows_no_email"] += 1
+            summary["details"].append({"row": row_num, "status": "no_email", "current_in_sheet": current_in_sheet})
+            continue
+
+        contact = ghl_find_contact_by_email(email)
+        if not contact:
+            summary["rows_no_ghl_match"] += 1
+            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match", "current_in_sheet": current_in_sheet})
+            continue
+
+        country = _extract_country(contact)
+
+        if not country:
+            entry = {"row": row_num, "email": email, "status": "no_country_data", "current_in_sheet": current_in_sheet}
+            if verbose:
+                entry["contact_keys"] = sorted(contact.keys())
+                entry["address_keys"] = sorted((contact.get("address") or {}).keys()) if isinstance(contact.get("address"), dict) else []
+            summary["rows_no_country_data"] += 1
+            summary["details"].append(entry)
+            continue
+
+        if not dry_run:
+            pending_writes.append({
+                "range": f"{target_col}{row_num}",
+                "values": [[country]],
+            })
+
+        entry = {
+            "row": row_num,
+            "email": email,
+            "status": "ok",
+            "country": country,
+            "current_in_sheet": current_in_sheet,
+        }
+        summary["rows_filled"] += 1
+        summary["details"].append(entry)
+
     if not dry_run and pending_writes:
         ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
         summary["write_success"] = ok
