@@ -2603,6 +2603,78 @@ async def backfill_country(request: Request):
     return JSONResponse(summary)
 
 
+@app.post("/admin/tag-contacts")
+async def tag_contacts(request: Request):
+    """
+    Apply one or more tags to a batch of contacts (looked up by email in GHL).
+
+    POST body:
+      {"emails": ["a@b.com", "c@d.com"], "tags": ["ss20livecall"]}
+      "tags" can also be a single string.
+    """
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    emails       = body.get("emails") or []
+    tags_to_add  = body.get("tags") or []
+    if isinstance(tags_to_add, str):
+        tags_to_add = [tags_to_add]
+    if not emails or not tags_to_add:
+        return JSONResponse({"error": "Need both 'emails' (list) and 'tags' (list or string)"}, status_code=400)
+
+    results = {"tagged": [], "not_found": [], "errors": []}
+
+    for raw_email in emails:
+        email = (raw_email or "").strip().lower()
+        if not email:
+            continue
+        contact = ghl_find_contact_by_email(email)
+        contact_id = (contact or {}).get("id", "")
+        if not contact_id:
+            results["not_found"].append(email)
+            continue
+
+        try:
+            r = http_requests.post(
+                f"{GHL_BASE_URL}/contacts/{contact_id}/tags",
+                json={"tags": tags_to_add},
+                headers={
+                    "Authorization": f"Bearer {GHL_TOKEN}",
+                    "Version": "2021-07-28",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            )
+            if r.status_code in (200, 201):
+                results["tagged"].append({"email": email, "id": contact_id})
+                logger.info(f"Tagged {email} ({contact_id}) with {tags_to_add}")
+            else:
+                results["errors"].append({
+                    "email": email,
+                    "status": r.status_code,
+                    "body": r.text[:300],
+                })
+                logger.error(f"Tag failed for {email}: HTTP {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            results["errors"].append({"email": email, "error": str(e)[:300]})
+            logger.error(f"Tag exception for {email}: {e}")
+
+    return JSONResponse({
+        "requested": len(emails),
+        "tags": tags_to_add,
+        "tagged_count": len(results["tagged"]),
+        "not_found_count": len(results["not_found"]),
+        "error_count": len(results["errors"]),
+        "details": results,
+    })
+
+
 @app.get("/health")
 async def health():
     sa_configured             = bool(GOOGLE_SA_JSON)
