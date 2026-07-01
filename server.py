@@ -2863,11 +2863,25 @@ async def backfill_monthly_revenue(request: Request):
             if contact:
                 match_method = "email"
                 summary["rows_matched_by_email"] += 1
-        if not contact and try_phone and phone:
-            contact = ghl_find_contact_by_phone(phone)
-            if contact:
-                match_method = "phone"
-                summary["rows_matched_by_phone"] += 1
+
+        revenue = _extract_monthly_revenue(contact) if contact else ""
+
+        # If the email-matched contact has no SOB, try phone — often there's a
+        # duplicate GHL record under the phone that has the field filled in.
+        if try_phone and phone and not revenue:
+            phone_contact = ghl_find_contact_by_phone(phone)
+            if phone_contact:
+                phone_revenue = _extract_monthly_revenue(phone_contact)
+                if phone_revenue:
+                    contact = phone_contact
+                    revenue = phone_revenue
+                    match_method = "phone" if not match_method else "email_then_phone"
+                    summary["rows_matched_by_phone"] += 1
+                elif not contact:
+                    # No email match at all — still count phone match even if SOB is empty
+                    contact = phone_contact
+                    match_method = "phone"
+                    summary["rows_matched_by_phone"] += 1
 
         if not contact:
             summary["rows_no_ghl_match"] += 1
@@ -2876,8 +2890,6 @@ async def backfill_monthly_revenue(request: Request):
                 "status": "no_ghl_match", "current_in_sheet": current_in_sheet,
             })
             continue
-
-        revenue = _extract_monthly_revenue(contact)
 
         if not revenue:
             entry = {
