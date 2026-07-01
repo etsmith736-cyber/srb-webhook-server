@@ -87,14 +87,12 @@ CF_MONTHLY_REVENUE   = "gutrh9bNDSIjw3ot4LUz"  # "What is your current monthly r
 # To add a new field: find its GHL id via /admin/list-custom-fields, then
 # add one entry here — no other code changes needed.
 CUSTOM_FIELD_CONFIG = [
-    {"id": CF_MONTHLY_REVENUE, "column": "AA", "label": "SOB"},
-    # IDs for the following are looked up via /admin/list-custom-fields and
-    # filled in via a follow-up commit:
-    # {"id": "?", "column": "AB", "label": "Goal"},
-    # {"id": "?", "column": "AC", "label": "Roadblock"},
-    # {"id": "?", "column": "AD", "label": "Urgency"},
-    # {"id": "?", "column": "AE", "label": "Finances"},
-    # {"id": "?", "column": "AF", "label": "Socials"},
+    {"id": CF_MONTHLY_REVENUE,     "column": "AA", "label": "SOB"},
+    {"id": "BNovfBpG64gmSqb72am5", "column": "AB", "label": "Goal"},
+    {"id": "XT6kirvh2gaxh3GB1Mqy", "column": "AC", "label": "Roadblock"},
+    {"id": "Wfau5h2I2bRmEQvbFDzB", "column": "AD", "label": "Urgency"},
+    {"id": "dHjE15bB8uVwpYBGqsmA", "column": "AE", "label": "Finances"},
+    {"id": "lePODdNwx3T9VPCx42v6", "column": "AF", "label": "Socials"},
 ]
 
 # ─── User ID → Name mapping ───────────────────────────────────
