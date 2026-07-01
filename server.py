@@ -76,9 +76,10 @@ if STRIPE_API_KEY:
 
 # ─── GHL custom field IDs ─────────────────────────────────────
 
-CF_UTM_CALL   = "PIP4Uqb6byKTtlkCdNru"
-CF_UTM_STAGE  = "pbbiyB60QSfnuBZpop1f"
-CF_UTM_SOURCE = "hQrjQsnMLfIMD8eLTtAY"
+CF_UTM_CALL          = "PIP4Uqb6byKTtlkCdNru"
+CF_UTM_STAGE         = "pbbiyB60QSfnuBZpop1f"
+CF_UTM_SOURCE        = "hQrjQsnMLfIMD8eLTtAY"
+CF_MONTHLY_REVENUE   = "gutrh9bNDSIjw3ot4LUz"  # "What is your current monthly revenue…" → written to column AA (SOB)
 
 # ─── User ID → Name mapping ───────────────────────────────────
 
@@ -2328,23 +2329,16 @@ def _country_from_phone(phone: str) -> str:
 
 
 def _extract_monthly_revenue(contact: dict) -> str:
-    """Extract the 'what_is_your_current_monthly_revenue' custom field value
-    from a GHL contact. GHL contact API responses sometimes expose the key on
-    the custom-field entry (as 'key', 'fieldKey', or with a 'contact.' prefix),
-    so we check every likely spot before giving up."""
+    """Extract the current monthly revenue custom field value (SOB) from a GHL
+    contact. GHL's contact API returns custom fields with only their internal
+    id, so we match by id (CF_MONTHLY_REVENUE)."""
     if not contact or not isinstance(contact, dict):
         return ""
-    target_keys = {
-        "what_is_your_current_monthly_revenue",
-        "contact.what_is_your_current_monthly_revenue",
-    }
     for cf in contact.get("customFields", []) or []:
         if not isinstance(cf, dict):
             continue
-        for key_field in ("key", "fieldKey", "name"):
-            val = cf.get(key_field)
-            if val and str(val).strip().lower() in target_keys:
-                return str(cf.get("value") or "").strip()
+        if cf.get("id") == CF_MONTHLY_REVENUE:
+            return str(cf.get("value") or "").strip()
     return ""
 
 
