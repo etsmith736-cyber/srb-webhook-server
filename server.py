@@ -888,9 +888,11 @@ def handle_appointment_created(body: dict):
 
     ft_campaign, ft_ad = "", ""
     lt_campaign, lt_ad = "", ""
+    monthly_revenue = ""
     if contact:
         ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
         lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
+        monthly_revenue = _extract_monthly_revenue(contact)
 
     # Country is derived from phone country code prefix (more reliable than
     # GHL's country field, which defaults to the location's country).
@@ -1010,6 +1012,14 @@ def handle_appointment_created(body: dict):
         logger.info(f"Wrote country '{country}' to Sales Calls Y{target_row} for {email}")
     elif target_row:
         logger.info(f"No country in GHL for {email} — leaving Y blank/unchanged")
+
+    # Write Monthly Revenue custom field to column AA (Stage of Business).
+    # Same skip-if-empty rule.
+    if target_row and monthly_revenue:
+        sheets_update_cell(target_row, "AA", monthly_revenue, tab="Sales Calls")
+        logger.info(f"Wrote SOB '{monthly_revenue}' to Sales Calls AA{target_row} for {email}")
+    elif target_row:
+        logger.info(f"No monthly revenue in GHL for {email} — leaving AA blank/unchanged")
 
 
 def handle_appointment_status(body: dict):
@@ -2317,6 +2327,27 @@ def _country_from_phone(phone: str) -> str:
     return ""
 
 
+def _extract_monthly_revenue(contact: dict) -> str:
+    """Extract the 'what_is_your_current_monthly_revenue' custom field value
+    from a GHL contact. GHL contact API responses sometimes expose the key on
+    the custom-field entry (as 'key', 'fieldKey', or with a 'contact.' prefix),
+    so we check every likely spot before giving up."""
+    if not contact or not isinstance(contact, dict):
+        return ""
+    target_keys = {
+        "what_is_your_current_monthly_revenue",
+        "contact.what_is_your_current_monthly_revenue",
+    }
+    for cf in contact.get("customFields", []) or []:
+        if not isinstance(cf, dict):
+            continue
+        for key_field in ("key", "fieldKey", "name"):
+            val = cf.get(key_field)
+            if val and str(val).strip().lower() in target_keys:
+                return str(cf.get("value") or "").strip()
+    return ""
+
+
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
     """Extract (campaign, ad/content) from a GHL attribution-source object,
     trying multiple field-name conventions. Returns values normalized to
@@ -2673,6 +2704,145 @@ async def tag_contacts(request: Request):
         "error_count": len(results["errors"]),
         "details": results,
     })
+
+
+def _col_letter_to_idx(col: str) -> int:
+    """Convert a Google Sheets column letter (or letters, e.g. AA) to a 0-based index."""
+    idx = 0
+    for c in col.upper():
+        idx = idx * 26 + (ord(c) - ord("A") + 1)
+    return idx - 1
+
+
+@app.post("/admin/backfill-monthly-revenue")
+async def backfill_monthly_revenue(request: Request):
+    """
+    Backfill column AA ('SOB' — Stage of Business) on Sales Calls by looking
+    up each row's email in GHL and pulling the value of the
+    'what_is_your_current_monthly_revenue' custom field.
+
+    Query params: start_row, end_row, last_n, dry_run, verbose — same meaning
+    as the other backfill endpoints.
+    """
+    params = dict(request.query_params)
+    tab     = params.get("tab", "Sales Calls")
+    dry_run = params.get("dry_run", "true").lower() != "false"
+    verbose = params.get("verbose", "false").lower() == "true"
+
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    if tab != "Sales Calls":
+        return JSONResponse({"error": f"Monthly Revenue backfill not wired up for tab {tab!r}"}, status_code=400)
+
+    target_col    = "AA"
+    email_col_idx = COL["Email"]
+    range_str     = "A:AA"
+
+    all_rows = sheets_read_all(tab=tab, range_str=range_str)
+    if not all_rows:
+        return JSONResponse({"error": f"Could not read tab {tab!r}"}, status_code=500)
+
+    total_rows = len(all_rows)
+
+    if "last_n" in params:
+        try:
+            n = int(params["last_n"])
+        except ValueError:
+            return JSONResponse({"error": "last_n must be an integer"}, status_code=400)
+        start_row = max(2, total_rows - n + 1)
+        end_row   = total_rows
+    else:
+        try:
+            start_row = int(params.get("start_row", "2"))
+            end_row   = int(params.get("end_row", str(total_rows)))
+        except ValueError:
+            return JSONResponse({"error": "start_row / end_row must be integers"}, status_code=400)
+        start_row = max(2, start_row)
+        end_row   = min(end_row, total_rows)
+
+    summary = {
+        "tab": tab,
+        "field": "monthly_revenue",
+        "target_col": target_col,
+        "start_row": start_row,
+        "end_row": end_row,
+        "dry_run": dry_run,
+        "total_rows_in_sheet": total_rows,
+        "rows_processed": 0,
+        "rows_filled": 0,
+        "rows_no_email": 0,
+        "rows_no_ghl_match": 0,
+        "rows_no_revenue_data": 0,
+        "write_success": None,
+        "write_error": "",
+        "details": [],
+    }
+
+    target_idx = _col_letter_to_idx(target_col)
+    pending_writes = []
+
+    for row_num in range(start_row, end_row + 1):
+        row_idx = row_num - 1
+        row = all_rows[row_idx] if row_idx < len(all_rows) else []
+        email = str(row[email_col_idx] or "").strip() if len(row) > email_col_idx else ""
+        current_in_sheet = str(row[target_idx]).strip() if len(row) > target_idx else ""
+
+        summary["rows_processed"] += 1
+
+        if not email:
+            summary["rows_no_email"] += 1
+            summary["details"].append({"row": row_num, "status": "no_email", "current_in_sheet": current_in_sheet})
+            continue
+
+        contact = ghl_find_contact_by_email(email)
+        if not contact:
+            summary["rows_no_ghl_match"] += 1
+            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match", "current_in_sheet": current_in_sheet})
+            continue
+
+        revenue = _extract_monthly_revenue(contact)
+
+        if not revenue:
+            entry = {"row": row_num, "email": email, "status": "no_revenue_data", "current_in_sheet": current_in_sheet}
+            if verbose:
+                cfs = contact.get("customFields", []) or []
+                # Sample the first few custom fields with their identifying keys
+                sample = []
+                if isinstance(cfs, list):
+                    for cf in cfs[:8]:
+                        if isinstance(cf, dict):
+                            sample.append({
+                                "id": cf.get("id"),
+                                "key": cf.get("key") or cf.get("fieldKey") or cf.get("name"),
+                                "value_preview": str(cf.get("value") or "")[:80],
+                            })
+                entry["custom_fields_sample"] = sample
+            summary["rows_no_revenue_data"] += 1
+            summary["details"].append(entry)
+            continue
+
+        if not dry_run:
+            pending_writes.append({
+                "range": f"{target_col}{row_num}",
+                "values": [[revenue]],
+            })
+
+        summary["rows_filled"] += 1
+        summary["details"].append({
+            "row": row_num,
+            "email": email,
+            "status": "ok",
+            "revenue": revenue,
+            "current_in_sheet": current_in_sheet,
+        })
+
+    if not dry_run and pending_writes:
+        ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
+        summary["write_success"] = ok
+        summary["write_error"] = err
+
+    return JSONResponse(summary)
 
 
 @app.get("/health")
