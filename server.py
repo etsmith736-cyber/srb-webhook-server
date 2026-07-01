@@ -304,6 +304,60 @@ def ghl_find_contact_by_email(email: str) -> dict:
     # Now fetch the full contact (which includes attributionSource / lastAttributionSource)
     return ghl_get_contact(contact_id)
 
+
+def ghl_find_contact_by_phone(phone: str) -> dict:
+    """
+    Find a GHL contact by phone number. Uses the duplicate-detection endpoint
+    with a 'number' parameter (GHL's phone-lookup equivalent), tries the same
+    number stripped of + and spaces if the first attempt fails. Returns {}
+    if not found or on error.
+    """
+    if not GHL_TOKEN or not phone:
+        return {}
+    raw = phone.strip()
+    variants = []
+    # 1) as-is
+    variants.append(raw)
+    # 2) digits only (strip +, spaces, dashes, brackets)
+    digits = "".join(c for c in raw if c.isdigit())
+    if digits and digits not in variants:
+        variants.append(digits)
+    # 3) with leading + if digits-only found
+    if digits:
+        plus_form = "+" + digits
+        if plus_form not in variants:
+            variants.append(plus_form)
+
+    contact_id = ""
+    for candidate in variants:
+        if not candidate:
+            continue
+        try:
+            r = http_requests.get(
+                f"{GHL_BASE_URL}/contacts/search/duplicate",
+                params={"locationId": GHL_LOCATION_ID, "number": candidate},
+                headers={
+                    "Authorization": f"Bearer {GHL_TOKEN}",
+                    "Version": "2021-07-28",
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json() or {}
+                contact_stub = data.get("contact") or {}
+                contact_id = contact_stub.get("id", "")
+                if contact_id:
+                    break
+            elif r.status_code != 404:
+                logger.warning(f"GHL phone duplicate-search returned {r.status_code} for {candidate}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"GHL phone duplicate-search failed for {candidate}: {e}")
+
+    if not contact_id:
+        return {}
+    return ghl_get_contact(contact_id)
+
 # ─── Google Sheets Helpers ────────────────────────────────────
 
 def sheets_read_all(tab: str = "Sales Calls", range_str: str = "A:R") -> list[list[str]]:
@@ -2719,9 +2773,11 @@ async def backfill_monthly_revenue(request: Request):
     as the other backfill endpoints.
     """
     params = dict(request.query_params)
-    tab     = params.get("tab", "Sales Calls")
-    dry_run = params.get("dry_run", "true").lower() != "false"
-    verbose = params.get("verbose", "false").lower() == "true"
+    tab          = params.get("tab", "Sales Calls")
+    dry_run      = params.get("dry_run", "true").lower() != "false"
+    verbose      = params.get("verbose", "false").lower() == "true"
+    only_missing = params.get("only_missing", "false").lower() == "true"
+    try_phone    = params.get("try_phone", "true").lower() != "false"
 
     if not GHL_TOKEN:
         return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
@@ -2731,6 +2787,7 @@ async def backfill_monthly_revenue(request: Request):
 
     target_col    = "AA"
     email_col_idx = COL["Email"]
+    phone_col_idx = COL["Phone"]
     range_str     = "A:AA"
 
     all_rows = sheets_read_all(tab=tab, range_str=range_str)
@@ -2762,10 +2819,15 @@ async def backfill_monthly_revenue(request: Request):
         "start_row": start_row,
         "end_row": end_row,
         "dry_run": dry_run,
+        "only_missing": only_missing,
+        "try_phone": try_phone,
         "total_rows_in_sheet": total_rows,
         "rows_processed": 0,
+        "rows_skipped_already_filled": 0,
         "rows_filled": 0,
-        "rows_no_email": 0,
+        "rows_matched_by_email": 0,
+        "rows_matched_by_phone": 0,
+        "rows_no_email_or_phone": 0,
         "rows_no_ghl_match": 0,
         "rows_no_revenue_data": 0,
         "write_success": None,
@@ -2780,25 +2842,49 @@ async def backfill_monthly_revenue(request: Request):
         row_idx = row_num - 1
         row = all_rows[row_idx] if row_idx < len(all_rows) else []
         email = str(row[email_col_idx] or "").strip() if len(row) > email_col_idx else ""
+        phone = str(row[phone_col_idx] or "").strip() if len(row) > phone_col_idx else ""
         current_in_sheet = str(row[target_idx]).strip() if len(row) > target_idx else ""
 
         summary["rows_processed"] += 1
 
-        if not email:
-            summary["rows_no_email"] += 1
-            summary["details"].append({"row": row_num, "status": "no_email", "current_in_sheet": current_in_sheet})
+        if only_missing and current_in_sheet:
+            summary["rows_skipped_already_filled"] += 1
             continue
 
-        contact = ghl_find_contact_by_email(email)
+        if not email and not phone:
+            summary["rows_no_email_or_phone"] += 1
+            summary["details"].append({"row": row_num, "status": "no_email_or_phone", "current_in_sheet": current_in_sheet})
+            continue
+
+        contact = {}
+        match_method = ""
+        if email:
+            contact = ghl_find_contact_by_email(email)
+            if contact:
+                match_method = "email"
+                summary["rows_matched_by_email"] += 1
+        if not contact and try_phone and phone:
+            contact = ghl_find_contact_by_phone(phone)
+            if contact:
+                match_method = "phone"
+                summary["rows_matched_by_phone"] += 1
+
         if not contact:
             summary["rows_no_ghl_match"] += 1
-            summary["details"].append({"row": row_num, "email": email, "status": "no_ghl_match", "current_in_sheet": current_in_sheet})
+            summary["details"].append({
+                "row": row_num, "email": email, "phone": phone,
+                "status": "no_ghl_match", "current_in_sheet": current_in_sheet,
+            })
             continue
 
         revenue = _extract_monthly_revenue(contact)
 
         if not revenue:
-            entry = {"row": row_num, "email": email, "status": "no_revenue_data", "current_in_sheet": current_in_sheet}
+            entry = {
+                "row": row_num, "email": email, "phone": phone,
+                "match_method": match_method,
+                "status": "no_revenue_data", "current_in_sheet": current_in_sheet,
+            }
             if verbose:
                 cfs = contact.get("customFields", []) or []
                 # Sample the first few custom fields with their identifying keys
@@ -2826,6 +2912,8 @@ async def backfill_monthly_revenue(request: Request):
         summary["details"].append({
             "row": row_num,
             "email": email,
+            "phone": phone,
+            "match_method": match_method,
             "status": "ok",
             "revenue": revenue,
             "current_in_sheet": current_in_sheet,
