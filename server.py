@@ -81,6 +81,22 @@ CF_UTM_STAGE         = "pbbiyB60QSfnuBZpop1f"
 CF_UTM_SOURCE        = "hQrjQsnMLfIMD8eLTtAY"
 CF_MONTHLY_REVENUE   = "gutrh9bNDSIjw3ot4LUz"  # "What is your current monthly revenue…" → written to column AA (SOB)
 
+# ─── Custom-field → Sales Calls column mapping ─────────────────
+# Single source of truth: /admin/backfill-custom-fields iterates this list,
+# and handle_appointment_created auto-populates all of them on new bookings.
+# To add a new field: find its GHL id via /admin/list-custom-fields, then
+# add one entry here — no other code changes needed.
+CUSTOM_FIELD_CONFIG = [
+    {"id": CF_MONTHLY_REVENUE, "column": "AA", "label": "SOB"},
+    # IDs for the following are looked up via /admin/list-custom-fields and
+    # filled in via a follow-up commit:
+    # {"id": "?", "column": "AB", "label": "Goal"},
+    # {"id": "?", "column": "AC", "label": "Roadblock"},
+    # {"id": "?", "column": "AD", "label": "Urgency"},
+    # {"id": "?", "column": "AE", "label": "Finances"},
+    # {"id": "?", "column": "AF", "label": "Socials"},
+]
+
 # ─── User ID → Name mapping ───────────────────────────────────
 
 USER_MAP = {
@@ -943,11 +959,15 @@ def handle_appointment_created(body: dict):
 
     ft_campaign, ft_ad = "", ""
     lt_campaign, lt_ad = "", ""
-    monthly_revenue = ""
+    # Values to write from CUSTOM_FIELD_CONFIG, keyed by target sheet column
+    custom_field_writes = {}
     if contact:
         ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
         lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
-        monthly_revenue = _extract_monthly_revenue(contact)
+        for cf in CUSTOM_FIELD_CONFIG:
+            val = _extract_custom_field(contact, cf["id"])
+            if val:
+                custom_field_writes[cf["column"]] = val
 
     # Country is derived from phone country code prefix (more reliable than
     # GHL's country field, which defaults to the location's country).
@@ -1068,13 +1088,14 @@ def handle_appointment_created(body: dict):
     elif target_row:
         logger.info(f"No country in GHL for {email} — leaving Y blank/unchanged")
 
-    # Write Monthly Revenue custom field to column AA (Stage of Business).
-    # Same skip-if-empty rule.
-    if target_row and monthly_revenue:
-        sheets_update_cell(target_row, "AA", monthly_revenue, tab="Sales Calls")
-        logger.info(f"Wrote SOB '{monthly_revenue}' to Sales Calls AA{target_row} for {email}")
+    # Write every configured custom field (SOB, Goal, Roadblock, etc.) to its
+    # target column. Skip empties so we don't overwrite existing values with blanks.
+    if target_row and custom_field_writes:
+        for column, value in custom_field_writes.items():
+            sheets_update_cell(target_row, column, value, tab="Sales Calls")
+            logger.info(f"Wrote custom field to Sales Calls {column}{target_row} for {email}: {value[:60]!r}")
     elif target_row:
-        logger.info(f"No monthly revenue in GHL for {email} — leaving AA blank/unchanged")
+        logger.info(f"No custom-field values pulled from GHL for {email} — leaving AA:AF unchanged")
 
 
 def handle_appointment_status(body: dict):
@@ -2382,18 +2403,46 @@ def _country_from_phone(phone: str) -> str:
     return ""
 
 
-def _extract_monthly_revenue(contact: dict) -> str:
-    """Extract the current monthly revenue custom field value (SOB) from a GHL
-    contact. GHL's contact API returns custom fields with only their internal
-    id, so we match by id (CF_MONTHLY_REVENUE)."""
-    if not contact or not isinstance(contact, dict):
+def _extract_custom_field(contact: dict, field_id: str) -> str:
+    """Get the value of a specific custom field from a GHL contact by internal
+    field id. GHL's contact API only returns custom fields with their internal
+    id (not the merge key), so id-based matching is the reliable path."""
+    if not contact or not isinstance(contact, dict) or not field_id:
         return ""
     for cf in contact.get("customFields", []) or []:
-        if not isinstance(cf, dict):
-            continue
-        if cf.get("id") == CF_MONTHLY_REVENUE:
+        if isinstance(cf, dict) and cf.get("id") == field_id:
             return str(cf.get("value") or "").strip()
     return ""
+
+
+def _extract_monthly_revenue(contact: dict) -> str:
+    """Backward-compatible convenience wrapper for the SOB field."""
+    return _extract_custom_field(contact, CF_MONTHLY_REVENUE)
+
+
+def list_ghl_custom_fields() -> list:
+    """Fetch every custom field defined for the location. Returns a list of
+    dicts with id, name, fieldKey, dataType, model. Used to look up the
+    internal id when adding a new field to CUSTOM_FIELD_CONFIG."""
+    if not GHL_TOKEN:
+        return []
+    try:
+        r = http_requests.get(
+            f"{GHL_BASE_URL}/locations/{GHL_LOCATION_ID}/customFields",
+            headers={
+                "Authorization": f"Bearer {GHL_TOKEN}",
+                "Version": "2021-07-28",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json() or {}
+            return data.get("customFields") or []
+        logger.warning(f"GHL customFields list returned {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"GHL customFields list failed: {e}")
+    return []
 
 
 def _extract_attribution_fields(attribution: dict) -> tuple[str, str]:
@@ -2935,6 +2984,165 @@ async def backfill_monthly_revenue(request: Request):
         ok, err = sheets_batch_update_ranges(pending_writes, tab=tab)
         summary["write_success"] = ok
         summary["write_error"] = err
+
+    return JSONResponse(summary)
+
+
+@app.get("/admin/list-custom-fields")
+async def admin_list_custom_fields():
+    """Return every custom field defined on the GHL location.
+
+    Used to discover the internal `id` of a merge field (contact payloads
+    reference custom fields by id only, not by fieldKey/name), so we can add
+    it to CUSTOM_FIELD_CONFIG.
+    """
+    fields = list_ghl_custom_fields()
+    simplified = []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        simplified.append({
+            "id":        f.get("id"),
+            "name":      f.get("name"),
+            "fieldKey":  f.get("fieldKey"),
+            "dataType":  f.get("dataType"),
+            "model":     f.get("model"),
+        })
+    return {"count": len(simplified), "fields": simplified}
+
+
+@app.post("/admin/backfill-custom-fields")
+async def admin_backfill_custom_fields(
+    dry_run:      bool = True,
+    verbose:      bool = False,
+    only_missing: bool = True,
+    try_phone:    bool = True,
+    last_n:       int  = 0,
+    start_row:    int  = 2,
+    end_row:      int  = 0,
+):
+    """Generic multi-field backfill driven by CUSTOM_FIELD_CONFIG.
+
+    For each Sales Calls row, look up the GHL contact (email first, phone
+    fallback) and write every configured custom field into its target column.
+
+    - only_missing=True → skip a cell that already has a value
+    - try_phone=True    → if email match returns a contact with no target
+                          data, try phone; prefer whichever contact has data
+    """
+    if not CUSTOM_FIELD_CONFIG:
+        return JSONResponse({"error": "CUSTOM_FIELD_CONFIG is empty"}, status_code=400)
+
+    tab = "Sales Calls"
+    max_col = max((cf["column"] for cf in CUSTOM_FIELD_CONFIG), key=_col_letter_to_idx)
+    range_str = f"A:{max_col}"
+
+    rows = sheets_read_all(tab=tab, range_str=range_str) or []
+    if not rows:
+        return {"error": "no rows read from sheet"}
+
+    data_rows = rows[1:]
+    total_data_rows = len(data_rows)
+
+    first_row = max(2, start_row)
+    last_row  = end_row if end_row else (total_data_rows + 1)
+    if last_n and last_n > 0:
+        first_row = max(first_row, (total_data_rows + 1) - last_n + 1)
+
+    email_idx = COL["Email"] - 1
+    phone_idx = COL["Phone"] - 1
+
+    col_lookup = [(cf["column"], _col_letter_to_idx(cf["column"]) - 1, cf["id"], cf["label"])
+                  for cf in CUSTOM_FIELD_CONFIG]
+
+    per_field_counts = {cf["label"]: 0 for cf in CUSTOM_FIELD_CONFIG}
+    summary = {
+        "dry_run":       dry_run,
+        "tab":           tab,
+        "range":         range_str,
+        "config":        [{"label": cf["label"], "column": cf["column"], "id": cf["id"]} for cf in CUSTOM_FIELD_CONFIG],
+        "scanned":       0,
+        "matched_email": 0,
+        "matched_phone": 0,
+        "no_contact":    0,
+        "rows_written":  0,
+        "cells_written": 0,
+        "per_field":     per_field_counts,
+        "samples":       [] if verbose else None,
+    }
+
+    updates = []  # (row, col_letter, value)
+
+    def _contact_has_any_target(c):
+        if not c:
+            return False
+        for _col, _idx, fid, _label in col_lookup:
+            if _extract_custom_field(c, fid):
+                return True
+        return False
+
+    for i, row in enumerate(data_rows):
+        actual_row = i + 2
+        if actual_row < first_row or actual_row > last_row:
+            continue
+        summary["scanned"] += 1
+
+        email = (row[email_idx] if len(row) > email_idx else "").strip()
+        phone = (row[phone_idx] if len(row) > phone_idx else "").strip()
+
+        contact = None
+        matched_via = None
+        if email:
+            contact = ghl_find_contact_by_email(email)
+            if contact:
+                matched_via = "email"
+
+        if try_phone and phone and not _contact_has_any_target(contact):
+            phone_contact = ghl_find_contact_by_phone(phone)
+            if phone_contact and _contact_has_any_target(phone_contact):
+                contact = phone_contact
+                matched_via = "phone"
+            elif phone_contact and not contact:
+                contact = phone_contact
+                matched_via = "phone"
+
+        if not contact:
+            summary["no_contact"] += 1
+            if verbose and summary["samples"] is not None and len(summary["samples"]) < 25:
+                summary["samples"].append({"row": actual_row, "email": email, "phone": phone, "matched": None})
+            continue
+
+        if matched_via == "email":
+            summary["matched_email"] += 1
+        elif matched_via == "phone":
+            summary["matched_phone"] += 1
+
+        row_wrote_anything = False
+        sample = {"row": actual_row, "email": email, "matched": matched_via, "wrote": {}}
+        for col_letter, col_idx, fid, label in col_lookup:
+            val = _extract_custom_field(contact, fid)
+            if not val:
+                continue
+            existing = (row[col_idx] if len(row) > col_idx else "").strip()
+            if only_missing and existing:
+                continue
+            updates.append((actual_row, col_letter, val))
+            per_field_counts[label] += 1
+            summary["cells_written"] += 1
+            row_wrote_anything = True
+            sample["wrote"][label] = val[:80]
+
+        if row_wrote_anything:
+            summary["rows_written"] += 1
+        if verbose and summary["samples"] is not None and len(summary["samples"]) < 25:
+            summary["samples"].append(sample)
+
+    if not dry_run and updates:
+        batch = [(f"{col}{row}", value) for row, col, value in updates]
+        CHUNK = 200
+        for start in range(0, len(batch), CHUNK):
+            chunk = batch[start:start+CHUNK]
+            sheets_batch_update_ranges(chunk, tab=tab)
 
     return JSONResponse(summary)
 
