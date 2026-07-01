@@ -3047,10 +3047,10 @@ async def admin_backfill_custom_fields(
     if last_n and last_n > 0:
         first_row = max(first_row, (total_data_rows + 1) - last_n + 1)
 
-    email_idx = COL["Email"] - 1
-    phone_idx = COL["Phone"] - 1
+    email_idx = COL["Email"]
+    phone_idx = COL["Phone"]
 
-    col_lookup = [(cf["column"], _col_letter_to_idx(cf["column"]) - 1, cf["id"], cf["label"])
+    col_lookup = [(cf["column"], _col_letter_to_idx(cf["column"]), cf["id"], cf["label"])
                   for cf in CUSTOM_FIELD_CONFIG]
 
     per_field_counts = {cf["label"]: 0 for cf in CUSTOM_FIELD_CONFIG}
@@ -3136,11 +3136,16 @@ async def admin_backfill_custom_fields(
             summary["samples"].append(sample)
 
     if not dry_run and updates:
-        batch = [(f"{col}{row}", value) for row, col, value in updates]
+        batch = [{"range": f"{col}{row}", "values": [[value]]} for row, col, value in updates]
         CHUNK = 200
         for start in range(0, len(batch), CHUNK):
             chunk = batch[start:start+CHUNK]
-            sheets_batch_update_ranges(chunk, tab=tab)
+            ok, err = sheets_batch_update_ranges(chunk, tab=tab)
+            if not ok:
+                summary["write_error"] = err
+                summary["write_success"] = False
+                return JSONResponse(summary)
+        summary["write_success"] = True
 
     return JSONResponse(summary)
 
