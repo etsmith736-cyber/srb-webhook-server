@@ -1846,9 +1846,15 @@ async def triage_cancelled(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "Cancelled", tab="Triage Calls")
-        logger.info(f"Updated Triage Call Showed + Roadmap Booked to Cancelled for {email} at row {existing_row}")
+        # Guard: don't overwrite an existing No-Show with Cancelled — a no-show
+        # is a stronger fact than a subsequent cancellation.
+        current_g = sheets_read_cell(existing_row, "G", tab="Triage Calls")
+        if current_g == "No-Show":
+            logger.info(f"Triage cancelled guard: row {existing_row} for {email} is 'No-Show' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "Cancelled", tab="Triage Calls")
+            logger.info(f"Updated Triage Call Showed + Roadmap Booked to Cancelled for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} to cancel")
 
@@ -1878,8 +1884,14 @@ async def triage_lost(request: Request):
 
     existing_row = find_row_by_email(email, tab="Triage Calls")
     if existing_row:
-        sheets_update_cell(existing_row, "G", "No", tab="Triage Calls")
-        logger.info(f"Updated Triage Call Showed to 'No' for {email} at row {existing_row}")
+        # Guard: don't overwrite an existing No-Show or Cancelled with 'No' —
+        # those are stronger facts than a later lost/disqualified event.
+        current_g = sheets_read_cell(existing_row, "G", tab="Triage Calls")
+        if current_g in ("No-Show", "Cancelled"):
+            logger.info(f"Triage lost guard: row {existing_row} for {email} is '{current_g}' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "No", tab="Triage Calls")
+            logger.info(f"Updated Triage Call Showed to 'No' for {email} at row {existing_row}")
     else:
         logger.warning(f"No Triage Call row found for {email} — cannot mark lost")
 
@@ -1972,30 +1984,54 @@ async def triage_pipeline(request: Request):
         logger.warning(f"No Triage Calls row found for {email} — cannot update pipeline stage")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
+    # Read the current G value once — used by the guard for Decision Pending /
+    # Won / Wrong Fit / Lost so we never destroy an existing No-Show or
+    # Cancelled record. Same safeguard as handle_pipeline_decision_pending on
+    # Sales Calls.
+    current_g = sheets_read_cell(existing_row, "G", tab="Triage Calls")
+    PROTECTED = ("No-Show", "Cancelled")
+
     if "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
         sheets_update_cell(existing_row, "G", "No-Show", tab="Triage Calls")
         sheets_update_cell(existing_row, "H", "No-Show", tab="Triage Calls")
         logger.info(f"Triage pipeline No-Show: G='No-Show', H='No-Show' for {email} at row {existing_row}")
     elif "decision pending" in stage_name:
-        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "Maybe", tab="Triage Calls")
-        logger.info(f"Triage pipeline Decision Pending: G='Showed', H='Maybe' for {email} at row {existing_row}")
+        if current_g in PROTECTED:
+            logger.info(f"Triage pipeline Decision Pending guard: row {existing_row} for {email} is '{current_g}' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "Maybe", tab="Triage Calls")
+            logger.info(f"Triage pipeline Decision Pending: G='Showed', H='Maybe' for {email} at row {existing_row}")
     elif "won" in stage_name or "roadmap" in stage_name:
-        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "Yes", tab="Triage Calls")
-        logger.info(f"Triage pipeline Won/Roadmap: G='Showed', H='Yes' for {email} at row {existing_row}")
+        if current_g in PROTECTED:
+            logger.info(f"Triage pipeline Won/Roadmap guard: row {existing_row} for {email} is '{current_g}' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "Yes", tab="Triage Calls")
+            logger.info(f"Triage pipeline Won/Roadmap: G='Showed', H='Yes' for {email} at row {existing_row}")
     elif "wrong fit" in stage_name:
-        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
-        logger.info(f"Triage pipeline Wrong Fit: G='Showed', H='No' for {email} at row {existing_row}")
+        if current_g in PROTECTED:
+            logger.info(f"Triage pipeline Wrong Fit guard: row {existing_row} for {email} is '{current_g}' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
+            logger.info(f"Triage pipeline Wrong Fit: G='Showed', H='No' for {email} at row {existing_row}")
     elif "lost" in stage_name:
-        sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
-        logger.info(f"Triage pipeline Lost: G='Showed', H='No' for {email} at row {existing_row}")
+        if current_g in PROTECTED:
+            logger.info(f"Triage pipeline Lost guard: row {existing_row} for {email} is '{current_g}' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Showed", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "No", tab="Triage Calls")
+            logger.info(f"Triage pipeline Lost: G='Showed', H='No' for {email} at row {existing_row}")
     elif "cancelled" in stage_name or "canceled" in stage_name:
-        sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
-        sheets_update_cell(existing_row, "H", "Cancelled", tab="Triage Calls")
-        logger.info(f"Triage pipeline Cancelled: G='Cancelled', H='Cancelled' for {email} at row {existing_row}")
+        # Cancelled can overwrite blank/Showed but must not destroy an existing
+        # No-Show — a no-show is a stronger fact than a later cancellation.
+        if current_g == "No-Show":
+            logger.info(f"Triage pipeline Cancelled guard: row {existing_row} for {email} is 'No-Show' — skipping")
+        else:
+            sheets_update_cell(existing_row, "G", "Cancelled", tab="Triage Calls")
+            sheets_update_cell(existing_row, "H", "Cancelled", tab="Triage Calls")
+            logger.info(f"Triage pipeline Cancelled: G='Cancelled', H='Cancelled' for {email} at row {existing_row}")
     else:
         logger.info(f"Triage pipeline: unrecognised stage '{stage_name}' for {email} — no update made")
 
