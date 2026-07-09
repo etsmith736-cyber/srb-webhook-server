@@ -3308,31 +3308,53 @@ async def admin_test_noshow_sync(request: Request):
     }
     out = {"email": email, "contact_id": contact_id, "dry_run": dry_run}
 
-    # Fetch appointments raw (with a wide startTime/endTime window; GHL v2
-    # returns empty without one).
+    # Try multiple GHL endpoints/param shapes and return raw responses.
     from datetime import datetime, timezone, timedelta
-    start_ms = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp() * 1000)
-    end_ms   = int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp() * 1000)
-    try:
-        r = http_requests.get(
-            f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
-            params={"startTime": start_ms, "endTime": end_ms, "locationId": GHL_LOCATION_ID},
-            headers=headers, timeout=15,
-        )
-        out["list_status"] = r.status_code
-        raw = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:2000]
-        out["list_raw_keys"] = sorted(raw.keys()) if isinstance(raw, dict) else "not-json"
-        events = raw.get("events") or raw.get("appointments") or [] if isinstance(raw, dict) else []
-        out["event_count"] = len(events)
-        # Simplified view of each event
-        out["events"] = [{
-            "id": e.get("id"), "startTime": e.get("startTime"),
-            "appointmentStatus": e.get("appointmentStatus"),
-            "calendarId": e.get("calendarId"), "title": e.get("title"),
-        } for e in events if isinstance(e, dict)][:20]
-    except Exception as e:
-        out["list_error"] = str(e)[:300]
-        return JSONResponse(out)
+    now = datetime.now(timezone.utc)
+    start_ms = int((now - timedelta(days=365)).timestamp() * 1000)
+    end_ms   = int((now + timedelta(days=180)).timestamp() * 1000)
+    start_iso = (now - timedelta(days=365)).isoformat().replace("+00:00","Z")
+    end_iso   = (now + timedelta(days=180)).isoformat().replace("+00:00","Z")
+
+    attempts = [
+        ("contacts_appointments_ms",  f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+         {"startTime": start_ms, "endTime": end_ms, "locationId": GHL_LOCATION_ID}),
+        ("contacts_appointments_iso", f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+         {"startTime": start_iso, "endTime": end_iso, "locationId": GHL_LOCATION_ID}),
+        ("calendars_events",          f"{GHL_BASE_URL}/calendars/events",
+         {"startTime": start_ms, "endTime": end_ms, "locationId": GHL_LOCATION_ID, "contactId": contact_id}),
+        ("contacts_appointments_bare", f"{GHL_BASE_URL}/contacts/{contact_id}/appointments", {}),
+    ]
+
+    out["attempts"] = []
+    events = []
+    for label, url, params in attempts:
+        try:
+            r = http_requests.get(url, params=params, headers=headers, timeout=15)
+            body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:800]
+            att = {"label": label, "url": url, "status": r.status_code}
+            if isinstance(body, dict):
+                att["keys"] = sorted(body.keys())
+                arr = body.get("events") or body.get("appointments") or []
+                att["count"] = len(arr) if isinstance(arr, list) else 0
+                if arr and not events:
+                    events = arr  # take the first non-empty
+                # Include a peek at the raw body if empty (for debugging)
+                if att["count"] == 0:
+                    att["raw"] = str(body)[:600]
+            else:
+                att["raw"] = str(body)[:600]
+            out["attempts"].append(att)
+        except Exception as e:
+            out["attempts"].append({"label": label, "url": url, "error": str(e)[:300]})
+
+    out["list_status"] = "see attempts"
+    out["event_count"] = len(events)
+    out["events"] = [{
+        "id": e.get("id"), "startTime": e.get("startTime"),
+        "appointmentStatus": e.get("appointmentStatus"),
+        "calendarId": e.get("calendarId"), "title": e.get("title"),
+    } for e in events if isinstance(e, dict)][:20]
 
     # Determine what the helper WOULD do
     from datetime import datetime, timezone
