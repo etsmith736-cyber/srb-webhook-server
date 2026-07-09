@@ -295,10 +295,17 @@ def ghl_mark_latest_appointment_noshow(contact_id: str) -> tuple[bool, str]:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    # 1. List appointments for the contact
+    # 1. List appointments for the contact. GHL v2's /contacts/{id}/appointments
+    #    returns zero events without a date range, so we pass a generous window
+    #    covering the last year and the next 6 months (in ms since epoch).
+    from datetime import datetime, timezone, timedelta
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp() * 1000)
+    end_ms   = int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp() * 1000)
     try:
         r = http_requests.get(
             f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+            params={"startTime": start_ms, "endTime": end_ms, "locationId": GHL_LOCATION_ID},
             headers=headers, timeout=15,
         )
         if r.status_code != 200:
@@ -3301,10 +3308,15 @@ async def admin_test_noshow_sync(request: Request):
     }
     out = {"email": email, "contact_id": contact_id, "dry_run": dry_run}
 
-    # Fetch appointments raw
+    # Fetch appointments raw (with a wide startTime/endTime window; GHL v2
+    # returns empty without one).
+    from datetime import datetime, timezone, timedelta
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp() * 1000)
+    end_ms   = int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp() * 1000)
     try:
         r = http_requests.get(
             f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+            params={"startTime": start_ms, "endTime": end_ms, "locationId": GHL_LOCATION_ID},
             headers=headers, timeout=15,
         )
         out["list_status"] = r.status_code
