@@ -3267,6 +3267,85 @@ async def admin_backfill_custom_fields(
     return JSONResponse(summary)
 
 
+@app.post("/admin/test-noshow-sync")
+async def admin_test_noshow_sync(request: Request):
+    """Probe the Layer-2 noshow sync end-to-end.
+
+    Body: {"email": "...", "dry_run": true|false, "apply": true|false}
+
+    - dry_run=true (default): fetches /contacts/{id}/appointments, picks the
+      candidate past appointment, and returns the raw list + which one would
+      get PATCHed. Does NOT call the PATCH.
+    - dry_run=false: calls ghl_mark_latest_appointment_noshow() end-to-end.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    email   = (body.get("email") or "").strip()
+    dry_run = bool(body.get("dry_run", True))
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    contact = ghl_find_contact_by_email(email)
+    if not contact:
+        return JSONResponse({"error": f"no GHL contact for {email}"}, status_code=404)
+    contact_id = contact.get("id") or contact.get("contactId")
+
+    headers = {
+        "Authorization": f"Bearer {GHL_TOKEN}",
+        "Version": "2021-07-28",
+        "Accept": "application/json",
+    }
+    out = {"email": email, "contact_id": contact_id, "dry_run": dry_run}
+
+    # Fetch appointments raw
+    try:
+        r = http_requests.get(
+            f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+            headers=headers, timeout=15,
+        )
+        out["list_status"] = r.status_code
+        raw = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:2000]
+        out["list_raw_keys"] = sorted(raw.keys()) if isinstance(raw, dict) else "not-json"
+        events = raw.get("events") or raw.get("appointments") or [] if isinstance(raw, dict) else []
+        out["event_count"] = len(events)
+        # Simplified view of each event
+        out["events"] = [{
+            "id": e.get("id"), "startTime": e.get("startTime"),
+            "appointmentStatus": e.get("appointmentStatus"),
+            "calendarId": e.get("calendarId"), "title": e.get("title"),
+        } for e in events if isinstance(e, dict)][:20]
+    except Exception as e:
+        out["list_error"] = str(e)[:300]
+        return JSONResponse(out)
+
+    # Determine what the helper WOULD do
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    def parse_iso(s):
+        try: return datetime.fromisoformat(str(s).replace("Z","+00:00"))
+        except: return None
+    past = [(parse_iso(e.get("startTime")), e) for e in events if isinstance(e, dict)]
+    past = [(t, e) for t, e in past if t and t <= now]
+    past.sort(key=lambda t: t[0], reverse=True)
+    if past:
+        target = past[0][1]
+        out["would_patch"] = {"id": target.get("id"), "startTime": target.get("startTime"),
+                              "currentStatus": target.get("appointmentStatus")}
+    else:
+        out["would_patch"] = None
+
+    if not dry_run:
+        ok, msg = ghl_mark_latest_appointment_noshow(contact_id)
+        out["patch_ok"] = ok
+        out["patch_msg"] = msg
+
+    return JSONResponse(out)
+
+
 @app.get("/admin/debug-ghl-opportunities")
 async def admin_debug_ghl_opportunities(email: str = ""):
     """Debug: dump raw GHL responses for a given contact.
