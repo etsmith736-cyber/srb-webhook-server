@@ -274,6 +274,85 @@ def ghl_get_contact(contact_id: str) -> dict:
         return {}
 
 
+def ghl_mark_latest_appointment_noshow(contact_id: str) -> tuple[bool, str]:
+    """Set the underlying GHL appointment status to 'noshow' for a contact.
+
+    Called from handle_pipeline_no_show so that even if a rep later moves the
+    contact into Long Term Follow Up, the appointment record itself keeps its
+    noshow status as the durable source of truth.
+
+    Strategy: pick the most recently-STARTED appointment for the contact (any
+    calendar). Sales calls, triage calls, workshops all get their own appt
+    record, and by the time a rep marks 'No Show' pipeline stage the most
+    recent past appointment is virtually always the one they no-showed.
+    Returns (ok, message).
+    """
+    if not contact_id or not GHL_TOKEN:
+        return False, "missing contact_id or GHL_TOKEN"
+    headers = {
+        "Authorization": f"Bearer {GHL_TOKEN}",
+        "Version": "2021-07-28",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    # 1. List appointments for the contact
+    try:
+        r = http_requests.get(
+            f"{GHL_BASE_URL}/contacts/{contact_id}/appointments",
+            headers=headers, timeout=15,
+        )
+        if r.status_code != 200:
+            return False, f"list appointments HTTP {r.status_code}: {r.text[:200]}"
+        events = (r.json() or {}).get("events") or (r.json() or {}).get("appointments") or []
+    except Exception as e:
+        return False, f"list appointments error: {e}"
+
+    if not events:
+        return False, "no appointments found for contact"
+
+    # 2. Pick the most recent appointment (highest startTime that isn't in the future)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    def parse_iso(s):
+        try:
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    past_events = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        start = parse_iso(e.get("startTime") or e.get("start_time"))
+        if not start:
+            continue
+        if start <= now:
+            past_events.append((start, e))
+    if not past_events:
+        return False, "no past appointments to mark"
+    past_events.sort(key=lambda t: t[0], reverse=True)
+    target = past_events[0][1]
+    event_id = target.get("id")
+    if not event_id:
+        return False, "target appointment missing id"
+
+    # 3. PATCH the appointment status to noshow. GHL v2 endpoint:
+    #    PUT /calendars/events/appointments/{eventId}
+    try:
+        r = http_requests.put(
+            f"{GHL_BASE_URL}/calendars/events/appointments/{event_id}",
+            headers=headers,
+            json={"appointmentStatus": "noshow"},
+            timeout=15,
+        )
+        if r.status_code in (200, 201, 204):
+            return True, f"marked appointment {event_id} as noshow"
+        return False, f"update HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, f"update error: {e}"
+
+
 def get_cf_value(contact: dict, field_id: str) -> str:
     for cf in contact.get("customFields", []):
         if cf.get("id") == field_id:
@@ -396,6 +475,23 @@ def sheets_read_all(tab: str = "Sales Calls", range_str: str = "A:R") -> list[li
     except Exception as e:
         logger.error(f"Failed to read sheet {tab}: {e}")
         return []
+
+
+def sheets_read_cell(row: int, col: str, tab: str = "Sales Calls") -> str:
+    """Return the raw string value of a single cell, or '' if unreadable/empty."""
+    service = get_sheets_service()
+    if not service:
+        return ""
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{tab}'!{col}{row}",
+        ).execute()
+        vals = result.get("values", [])
+        return str(vals[0][0]).strip() if vals and vals[0] else ""
+    except Exception as e:
+        logger.warning(f"sheets_read_cell error at {tab}!{col}{row}: {e}")
+        return ""
 
 
 def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int = None) -> Optional[int]:
@@ -847,7 +943,9 @@ def handle_pipeline_lost(body: dict):
 
 
 def handle_pipeline_no_show(body: dict):
-    """Handle pipeline stage change to No-Show — update G and H."""
+    """Handle pipeline stage change to No-Show — update G and H, and mark the
+    underlying GHL appointment as 'noshow' so the record survives any future
+    stage moves (e.g. rep bulk-moving No-Show → Long Term Follow Up)."""
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
     email = extract_field(body, "email")
     if not email and contact_id:
@@ -864,9 +962,22 @@ def handle_pipeline_no_show(body: dict):
     sheets_update_cell(existing_row, "H", "No-Show")
     logger.info(f"Pipeline No-Show: updated G='No-Show', H='No-Show' for {email} at row {existing_row}")
 
+    # Also mark the underlying GHL appointment noshow so it's durable.
+    if contact_id:
+        ok, msg = ghl_mark_latest_appointment_noshow(contact_id)
+        if ok:
+            logger.info(f"GHL appointment noshow sync for {email}: {msg}")
+        else:
+            logger.warning(f"GHL appointment noshow sync failed for {email}: {msg}")
+
 
 def handle_pipeline_decision_pending(body: dict):
-    """Handle pipeline stage change to Showed - Decision Pending or Long Term Follow Up."""
+    """Handle pipeline stage change to Showed - Decision Pending or Long Term Follow Up.
+
+    Safeguard: if the row is currently marked 'No-Show', do NOT overwrite it.
+    A rep moving an existing no-show into LTF/Decision-Pending shouldn't destroy
+    the no-show record — the appointment truly didn't happen.
+    """
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
     email = extract_field(body, "email")
     if not email and contact_id:
@@ -879,6 +990,12 @@ def handle_pipeline_decision_pending(body: dict):
     if not existing_row:
         logger.warning(f"No row found for {email} — cannot update Decision Pending")
         return
+
+    current_showed = sheets_read_cell(existing_row, "G")
+    if current_showed == "No-Show":
+        logger.info(f"Pipeline Decision Pending guard: row {existing_row} for {email} is already 'No-Show' — skipping G/H overwrite")
+        return
+
     sheets_update_cell(existing_row, "G", "Showed")
     sheets_update_cell(existing_row, "H", "Maybe")
     logger.info(f"Pipeline Decision Pending: updated G='Showed', H='Maybe' for {email} at row {existing_row}")
