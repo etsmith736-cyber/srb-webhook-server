@@ -999,8 +999,8 @@ def handle_pipeline_decision_pending(body: dict):
         return
 
     current_showed = sheets_read_cell(existing_row, "G")
-    if current_showed == "No-Show":
-        logger.info(f"Pipeline Decision Pending guard: row {existing_row} for {email} is already 'No-Show' — skipping G/H overwrite")
+    if current_showed in ("No-Show", "Cancelled"):
+        logger.info(f"Pipeline Decision Pending guard: row {existing_row} for {email} is already '{current_showed}' — skipping G/H overwrite")
         return
 
     sheets_update_cell(existing_row, "G", "Showed")
@@ -3458,23 +3458,30 @@ async def admin_debug_ghl_opportunities(email: str = ""):
 
 @app.post("/admin/restore-no-shows")
 async def admin_restore_no_shows(request: Request):
-    """Restore G='No-Show', H='No-Show' for a list of emails on Sales Calls.
+    """Restore G/H on Sales Calls for a list of emails.
 
-    Body: {"emails": ["a@b.com", ...], "dry_run": true, "force": false}
+    Body: {"emails": [...], "target_status": "No-Show"|"Cancelled",
+           "dry_run": true, "force": false}
 
-    Safety: by default only restores rows that currently look like the bug
-    signature — G='Showed' AND H='Maybe'. Any other current state is skipped
-    (this avoids clobbering legitimate "Showed" rows or already-restored ones).
-    Set force=true to override that check.
+    Writes G=target_status, H=target_status (mirroring the pipeline_no_show
+    and pipeline_cancelled webhook behaviour).
+
+    Safety: by default only touches rows whose current state matches the LTF
+    bug signature — G='Showed' AND H='Maybe'. Any other current state is
+    skipped (protects legitimate closes / re-shows). Set force=true to
+    override; also protects rows already showing target_status.
     """
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    emails_in = body.get("emails") or []
-    dry_run   = bool(body.get("dry_run", True))
-    force     = bool(body.get("force", False))
+    emails_in     = body.get("emails") or []
+    target_status = (body.get("target_status") or "No-Show").strip()
+    dry_run       = bool(body.get("dry_run", True))
+    force         = bool(body.get("force", False))
+    if target_status not in ("No-Show", "Cancelled"):
+        return JSONResponse({"error": "target_status must be 'No-Show' or 'Cancelled'"}, status_code=400)
 
     if not isinstance(emails_in, list) or not emails_in:
         return JSONResponse({"error": "body must include 'emails' as a non-empty list"}, status_code=400)
@@ -3529,7 +3536,7 @@ async def admin_restore_no_shows(request: Request):
         curr_showed = (r[showed_idx] if len(r) > showed_idx else "").strip()
         curr_closed = (r[closed_idx] if len(r) > closed_idx else "").strip()
 
-        if curr_showed == "No-Show" and curr_closed == "No-Show":
+        if curr_showed == target_status and curr_closed == target_status:
             summary["already_ok"].append({"email": raw, "row": row_num})
             continue
 
@@ -3541,10 +3548,11 @@ async def admin_restore_no_shows(request: Request):
             })
             continue
 
-        to_write.append((row_num, "G", "No-Show"))
-        to_write.append((row_num, "H", "No-Show"))
+        to_write.append((row_num, "G", target_status))
+        to_write.append((row_num, "H", target_status))
         summary["restored_rows"].append({"email": raw, "row": row_num,
-                                         "from": [curr_showed, curr_closed]})
+                                         "from": [curr_showed, curr_closed],
+                                         "to": target_status})
         summary["restored"] += 1
 
     if not dry_run and to_write:
