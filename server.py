@@ -3150,6 +3150,112 @@ async def admin_backfill_custom_fields(
     return JSONResponse(summary)
 
 
+@app.post("/admin/restore-no-shows")
+async def admin_restore_no_shows(request: Request):
+    """Restore G='No-Show', H='No-Show' for a list of emails on Sales Calls.
+
+    Body: {"emails": ["a@b.com", ...], "dry_run": true, "force": false}
+
+    Safety: by default only restores rows that currently look like the bug
+    signature — G='Showed' AND H='Maybe'. Any other current state is skipped
+    (this avoids clobbering legitimate "Showed" rows or already-restored ones).
+    Set force=true to override that check.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    emails_in = body.get("emails") or []
+    dry_run   = bool(body.get("dry_run", True))
+    force     = bool(body.get("force", False))
+
+    if not isinstance(emails_in, list) or not emails_in:
+        return JSONResponse({"error": "body must include 'emails' as a non-empty list"}, status_code=400)
+
+    tab = "Sales Calls"
+    rows = sheets_read_all(tab=tab, range_str="A:H") or []
+    if not rows:
+        return JSONResponse({"error": "no rows read from sheet"}, status_code=500)
+
+    email_idx  = COL["Email"]
+    showed_idx = COL["Showed"]
+    closed_idx = COL["Closed"]
+
+    # Build email → row-number index (1-indexed sheet rows). If a duplicate
+    # email exists across multiple rows, we only restore the FIRST one to
+    # avoid touching later bookings.
+    email_to_row = {}
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) <= email_idx:
+            continue
+        e = (r[email_idx] or "").strip().lower()
+        if not e or e in email_to_row:
+            continue
+        email_to_row[e] = i
+
+    summary = {
+        "dry_run":   dry_run,
+        "force":     force,
+        "requested": len(emails_in),
+        "matched":   0,
+        "restored":  0,
+        "skipped_no_row":    [],
+        "skipped_bad_state": [],
+        "already_ok":        [],
+        "restored_rows":     [],
+        "write_success":     None,
+        "write_error":       "",
+    }
+
+    to_write = []  # list of (row, "G"|"H", value)
+
+    for raw in emails_in:
+        email = (raw or "").strip().lower()
+        if not email:
+            continue
+        row_num = email_to_row.get(email)
+        if not row_num:
+            summary["skipped_no_row"].append(raw)
+            continue
+        summary["matched"] += 1
+        r = rows[row_num - 1]
+        curr_showed = (r[showed_idx] if len(r) > showed_idx else "").strip()
+        curr_closed = (r[closed_idx] if len(r) > closed_idx else "").strip()
+
+        if curr_showed == "No-Show" and curr_closed == "No-Show":
+            summary["already_ok"].append({"email": raw, "row": row_num})
+            continue
+
+        # Bug signature: G='Showed' AND H='Maybe'. Skip anything else unless force=true.
+        if not force and (curr_showed != "Showed" or curr_closed != "Maybe"):
+            summary["skipped_bad_state"].append({
+                "email": raw, "row": row_num,
+                "showed": curr_showed, "closed": curr_closed,
+            })
+            continue
+
+        to_write.append((row_num, "G", "No-Show"))
+        to_write.append((row_num, "H", "No-Show"))
+        summary["restored_rows"].append({"email": raw, "row": row_num,
+                                         "from": [curr_showed, curr_closed]})
+        summary["restored"] += 1
+
+    if not dry_run and to_write:
+        batch = [{"range": f"{col}{row}", "values": [[val]]} for row, col, val in to_write]
+        CHUNK = 200
+        for start in range(0, len(batch), CHUNK):
+            chunk = batch[start:start+CHUNK]
+            ok, err = sheets_batch_update_ranges(chunk, tab=tab)
+            if not ok:
+                summary["write_error"] = err
+                summary["write_success"] = False
+                return JSONResponse(summary)
+        summary["write_success"] = True
+
+    return JSONResponse(summary)
+
+
 @app.get("/health")
 async def health():
     sa_configured             = bool(GOOGLE_SA_JSON)
