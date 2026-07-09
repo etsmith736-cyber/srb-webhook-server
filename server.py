@@ -3150,6 +3150,82 @@ async def admin_backfill_custom_fields(
     return JSONResponse(summary)
 
 
+@app.get("/admin/debug-ghl-opportunities")
+async def admin_debug_ghl_opportunities(email: str = ""):
+    """Debug: dump raw GHL responses for a given contact.
+
+    Hits the contact endpoint, then searches opportunities for that contact,
+    then fetches each opportunity by id and returns everything. Used to
+    inspect whether GHL exposes stage-change history in any of these payloads.
+    """
+    if not email:
+        return JSONResponse({"error": "email query param required"}, status_code=400)
+    if not GHL_TOKEN:
+        return JSONResponse({"error": "GHL_TOKEN not configured"}, status_code=500)
+
+    headers = {
+        "Authorization": f"Bearer {GHL_TOKEN}",
+        "Version": "2021-07-28",
+        "Accept": "application/json",
+    }
+
+    out = {"email": email}
+
+    contact = ghl_find_contact_by_email(email)
+    if not contact:
+        out["contact"] = None
+        return JSONResponse(out)
+
+    contact_id = contact.get("id") or contact.get("contactId") or ""
+    out["contact"] = {
+        "id":         contact_id,
+        "email":      contact.get("email"),
+        "createdAt":  contact.get("dateAdded") or contact.get("createdAt"),
+        "updatedAt":  contact.get("dateUpdated") or contact.get("updatedAt"),
+        "tags":       contact.get("tags"),
+    }
+
+    # Search opportunities for this contact
+    try:
+        r = http_requests.get(
+            f"{GHL_BASE_URL}/opportunities/search",
+            params={"location_id": GHL_LOCATION_ID, "contact_id": contact_id, "limit": 20},
+            headers=headers,
+            timeout=15,
+        )
+        out["opportunities_search_status"] = r.status_code
+        out["opportunities_search_raw"] = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:2000]
+    except Exception as e:
+        out["opportunities_search_error"] = str(e)[:300]
+
+    # Also try individual opportunity GET for each opp we found
+    opps = []
+    try:
+        raw = out.get("opportunities_search_raw", {})
+        if isinstance(raw, dict):
+            opps = raw.get("opportunities") or raw.get("data") or []
+    except Exception:
+        pass
+
+    out["opportunity_details"] = []
+    for opp in opps[:5]:
+        opp_id = opp.get("id") if isinstance(opp, dict) else None
+        if not opp_id:
+            continue
+        try:
+            r = http_requests.get(
+                f"{GHL_BASE_URL}/opportunities/{opp_id}",
+                headers=headers,
+                timeout=15,
+            )
+            body = r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:2000]
+            out["opportunity_details"].append({"id": opp_id, "status": r.status_code, "body": body})
+        except Exception as e:
+            out["opportunity_details"].append({"id": opp_id, "error": str(e)[:300]})
+
+    return JSONResponse(out)
+
+
 @app.post("/admin/restore-no-shows")
 async def admin_restore_no_shows(request: Request):
     """Restore G='No-Show', H='No-Show' for a list of emails on Sales Calls.
