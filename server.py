@@ -87,12 +87,13 @@ CF_MONTHLY_REVENUE   = "gutrh9bNDSIjw3ot4LUz"  # "What is your current monthly r
 # To add a new field: find its GHL id via /admin/list-custom-fields, then
 # add one entry here — no other code changes needed.
 CUSTOM_FIELD_CONFIG = [
-    {"id": CF_MONTHLY_REVENUE,     "column": "AA", "label": "SOB"},
-    {"id": "BNovfBpG64gmSqb72am5", "column": "AB", "label": "Goal"},
-    {"id": "XT6kirvh2gaxh3GB1Mqy", "column": "AC", "label": "Roadblock"},
-    {"id": "Wfau5h2I2bRmEQvbFDzB", "column": "AD", "label": "Urgency"},
-    {"id": "dHjE15bB8uVwpYBGqsmA", "column": "AE", "label": "Finances"},
-    {"id": "lePODdNwx3T9VPCx42v6", "column": "AF", "label": "Socials"},
+    {"id": "OYoCcRD4FXKP5hsl4vge", "column": "AA", "label": "Type"},
+    {"id": CF_MONTHLY_REVENUE,     "column": "AB", "label": "SOB"},
+    {"id": "BNovfBpG64gmSqb72am5", "column": "AC", "label": "Goal"},
+    {"id": "XT6kirvh2gaxh3GB1Mqy", "column": "AD", "label": "Roadblock"},
+    {"id": "Wfau5h2I2bRmEQvbFDzB", "column": "AE", "label": "Urgency"},
+    {"id": "dHjE15bB8uVwpYBGqsmA", "column": "AF", "label": "Finances"},
+    {"id": "lePODdNwx3T9VPCx42v6", "column": "AG", "label": "Socials"},
 ]
 
 # ─── User ID → Name mapping ───────────────────────────────────
