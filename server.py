@@ -92,7 +92,7 @@ CUSTOM_FIELD_CONFIG = [
     {"id": "BNovfBpG64gmSqb72am5", "column": "AC", "label": "Goal"},
     {"id": "XT6kirvh2gaxh3GB1Mqy", "column": "AD", "label": "Roadblock"},
     {"id": "Wfau5h2I2bRmEQvbFDzB", "column": "AE", "label": "Urgency"},
-    {"id": "dHjE15bB8uVwpYBGqsmA", "column": "AF", "label": "Finances"},
+    {"id": "Q6WJRK90PcmIfbAups0u", "column": "AF", "label": "Finances"},
     {"id": "lePODdNwx3T9VPCx42v6", "column": "AG", "label": "Socials"},
 ]
 
