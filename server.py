@@ -1267,6 +1267,22 @@ def handle_appointment_created(body: dict):
                 target_row, "R", date_of_purchase, value_input_option="USER_ENTERED",
             )
 
+    # Column T self-links the Fathom recording for this contact. The recordings land
+    # in the "All Fathom Recordings" tab via Zapier from Sofia's Fathom team account,
+    # so the sheet can resolve the link itself — exact email first, then a wildcard
+    # match to catch rows whose Fathom entry holds two comma-separated emails.
+    # Written per row because appended rows are created one at a time.
+    if target_row:
+        fathom_lookup = (
+            f'=IF($E{target_row}="","",'
+            f"IFERROR(VLOOKUP($E{target_row},'All Fathom Recordings'!$B$2:$C$1000,2,FALSE),"
+            f'IFERROR(VLOOKUP("*"&$E{target_row}&"*",'
+            f"'All Fathom Recordings'!$B$2:$C$1000,2,FALSE),\"\")))"
+        )
+        sheets_update_cell(
+            target_row, "T", fathom_lookup, value_input_option="USER_ENTERED",
+        )
+
     # Write First/Last Touch Campaign + Ad to U:X if GHL had attribution data.
     # If GHL has nothing, leave U:X alone (preserves any existing values on reschedule;
     # leaves blank on new appends — matches user-chosen "skip" behaviour).
