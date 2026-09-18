@@ -51,7 +51,7 @@ from googleapiclient.errors import HttpError
 # ─── Configuration (from environment variables) ───────────────
 
 SPREADSHEET_ID        = os.environ.get("SPREADSHEET_ID",        "143pCbA2rktBqI-t3EYUjZBiZNZv0i-WxuPobN9wKRW0")
-GHL_TOKEN             = os.environ.get("GHL_TOKEN",             "pit-0fb92538-98d8-4398-ad6b-6714a566bdbd")
+GHL_TOKEN             = os.environ.get("GHL_TOKEN",             "")
 GHL_LOCATION_ID       = os.environ.get("GHL_LOCATION_ID",       "n4rqgABEMiHBL5Ui84JV")
 GHL_BASE_URL          = os.environ.get("GHL_BASE_URL",          "https://services.leadconnectorhq.com")
 PORT                  = int(os.environ.get("PORT",              "8000"))
@@ -129,7 +129,15 @@ STATUS_MAP = {
 
 # ─── Timezone ─────────────────────────────────────────────────
 
-AEST = timezone(timedelta(hours=10))
+# Adelaide observes daylight saving (ACST +9:30 / ACDT +10:30). A fixed offset
+# silently shifts every timestamp by 30 minutes and flips sign twice a year, which
+# lands near-midnight events on the wrong calendar day. Use the real zone, and fall
+# back to +9:30 only if the tz database is unavailable in the container.
+try:
+    from zoneinfo import ZoneInfo
+    AEST = ZoneInfo("Australia/Adelaide")
+except Exception:  # pragma: no cover
+    AEST = timezone(timedelta(hours=9, minutes=30))
 
 # ─── Column indices (0-based) ─────────────────────────────────
 
@@ -172,6 +180,14 @@ TRIAGE_COL = {
 }
 
 # ─── Logging ──────────────────────────────────────────────────
+
+if not GHL_TOKEN:
+    print(
+        "CRITICAL: GHL_TOKEN is not set. The token is no longer hard-coded in this "
+        "file (it was published in a public repo) — set it as an environment variable "
+        "in Railway or every GoHighLevel lookup will fail.",
+        file=sys.stderr,
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -518,7 +534,7 @@ def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int =
     return None
 
 
-def sheets_append_row(values: list[str], tab: str = "Sales Calls"):
+def sheets_append_row(values: list[str], tab: str = "Sales Calls", value_input_option: str = "RAW"):
     """Append a new row to the specified tab."""
     service = get_sheets_service()
     if not service:
@@ -529,7 +545,7 @@ def sheets_append_row(values: list[str], tab: str = "Sales Calls"):
         service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!{range_str}",
-            valueInputOption="RAW",
+            valueInputOption=value_input_option,
             insertDataOption="INSERT_ROWS",
             body={"values": [values]},
         ).execute()
@@ -540,7 +556,7 @@ def sheets_append_row(values: list[str], tab: str = "Sales Calls"):
         logger.error(f"Failed to append row to {tab}: {e}")
 
 
-def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Calls"):
+def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Calls", value_input_option: str = "RAW"):
     """Overwrite an existing row (1-based) in the specified tab."""
     service = get_sheets_service()
     if not service:
@@ -551,7 +567,7 @@ def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Call
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!A{row_number}:{end_col}{row_number}",
-            valueInputOption="RAW",
+            valueInputOption=value_input_option,
             body={"values": [values]},
         ).execute()
         logger.info(f"Row {row_number} updated successfully in {tab}")
@@ -561,7 +577,7 @@ def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Call
         logger.error(f"Failed to update row {row_number} in {tab}: {e}")
 
 
-def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = "Sales Calls"):
+def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = "Sales Calls", value_input_option: str = "RAW"):
     """Update a single cell in the specified tab."""
     service = get_sheets_service()
     if not service:
@@ -571,7 +587,7 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = 
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!{col_letter}{row_number}",
-            valueInputOption="RAW",
+            valueInputOption=value_input_option,
             body={"values": [[value]]},
         ).execute()
         logger.info(f"Cell {col_letter}{row_number} updated to '{value}' in {tab}")
@@ -581,7 +597,7 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = 
         logger.error(f"Failed to update cell {col_letter}{row_number} in {tab}: {e}")
 
 
-def sheets_update_range(row_number: int, start_col: str, values: list, tab: str = "Sales Calls"):
+def sheets_update_range(row_number: int, start_col: str, values: list, tab: str = "Sales Calls", value_input_option: str = "RAW"):
     """Update a contiguous horizontal range of cells in a single row with one API call."""
     service = get_sheets_service()
     if not service:
@@ -592,7 +608,7 @@ def sheets_update_range(row_number: int, start_col: str, values: list, tab: str 
         service.spreadsheets().values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{tab}'!{start_col}{row_number}:{end_col}{row_number}",
-            valueInputOption="RAW",
+            valueInputOption=value_input_option,
             body={"values": [values]},
         ).execute()
         logger.info(f"Range {start_col}{row_number}:{end_col}{row_number} updated in {tab}")
@@ -635,6 +651,44 @@ def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls") -> tuple
         msg = f"Batch update failed for {tab}: {e}"
         logger.error(msg)
         return False, str(e)[:300]
+
+
+def _strip_currency_text(value: str) -> str:
+    """Turn a display string like "$1,000.00" (or a stray leading apostrophe) back
+    into a bare number string so USER_ENTERED stores it as a real number. Formulas
+    and anything non-numeric are returned untouched."""
+    v = str(value or "").strip()
+    if not v or v.startswith("="):
+        return v
+    if v.startswith("'"):
+        v = v[1:].strip()
+    cleaned = v.replace("$", "").replace(",", "").replace(" ", "")
+    try:
+        float(cleaned)
+        return cleaned
+    except ValueError:
+        return v
+
+
+def sheets_read_row_formulas(row_number: int, tab: str = "Sales Calls") -> list[str]:
+    """Read one row with valueRenderOption=FORMULA, so existing formulas (e.g. =I2*J2
+    in Contracted Revenue) come back as formulas instead of their computed values and
+    can be written back intact."""
+    service = get_sheets_service()
+    if not service:
+        return []
+    end_col = "R" if tab == "Sales Calls" else "N"
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{tab}'!A{row_number}:{end_col}{row_number}",
+            valueRenderOption="FORMULA",
+        ).execute()
+        values = result.get("values", [])
+        return values[0] if values else []
+    except Exception as e:
+        logger.error(f"Failed to read row {row_number} formulas from {tab}: {e}")
+        return []
 
 
 def sheets_highlight_row(row_number: int, red: float, green: float, blue: float):
@@ -912,9 +966,11 @@ def handle_opportunity_won(body: dict):
                     break
 
         if found_data:
-            sheets_update_cell(existing_row, "I", f"{amount_aud:.2f}")
-            sheets_update_cell(existing_row, "J", str(num_payments))
-            sheets_update_cell(existing_row, "K", f"{contracted_revenue_aud:.2f}")
+            sheets_update_range(
+                existing_row, "I",
+                [f"{amount_aud:.2f}", str(num_payments), f"{contracted_revenue_aud:.2f}"],
+                value_input_option="USER_ENTERED",
+            )
             logger.info(f"Updated financial data for {email} from Stripe lookup")
             if not is_primary:
                 logger.info(f"Fallback strategy used for {email} — highlighting row orange")
@@ -1170,22 +1226,46 @@ def handle_appointment_created(body: dict):
     existing_row = find_row_by_email(email)
     if existing_row:
         logger.info(f"Duplicate found at row {existing_row} for {email} — updating (reschedule)")
-        all_rows = sheets_read_all()
-        if existing_row - 1 < len(all_rows):
-            old = all_rows[existing_row - 1]
+        # Read with FORMULA rendering so a preserved "=I2*J2" in Contracted Revenue
+        # survives the reschedule instead of being flattened into its displayed text.
+        old = sheets_read_row_formulas(existing_row)
+        if old:
             for preserve_col in [
                 "Showed", "Closed", "Cash Collected (AUD)",
                 "Number of Payments", "Contracted Revenue (AUD)", "Notes", "Date of Purchase",
             ]:
                 idx = COL[preserve_col]
-                if idx < len(old) and old[idx].strip():
-                    row[idx] = old[idx]
+                if idx < len(old) and str(old[idx]).strip():
+                    row[idx] = str(old[idx])
         sheets_update_row(existing_row, row)
         target_row = existing_row
     else:
         logger.info(f"New contact {email} — appending row")
         sheets_append_row(row)
         target_row = find_row_by_email(email)
+
+    # The row itself is written RAW because USER_ENTERED strips the leading "+" from
+    # phone numbers. Re-write only the date and money columns with USER_ENTERED so
+    # they land as real dates/numbers rather than left-aligned text.
+    if target_row:
+        sheets_update_range(
+            target_row, "A", [date_booked, date_of_call],
+            value_input_option="USER_ENTERED",
+        )
+        money = [
+            _strip_currency_text(row[COL["Cash Collected (AUD)"]]),
+            _strip_currency_text(row[COL["Number of Payments"]]),
+            _strip_currency_text(row[COL["Contracted Revenue (AUD)"]]),
+        ]
+        if any(money):
+            sheets_update_range(
+                target_row, "I", money, value_input_option="USER_ENTERED",
+            )
+        date_of_purchase = _strip_currency_text(row[COL["Date of Purchase"]])
+        if date_of_purchase:
+            sheets_update_cell(
+                target_row, "R", date_of_purchase, value_input_option="USER_ENTERED",
+            )
 
     # Write First/Last Touch Campaign + Ad to U:X if GHL had attribution data.
     # If GHL has nothing, leave U:X alone (preserves any existing values on reschedule;
@@ -1395,25 +1475,37 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple:
             return num_payments, total_amount, False
 
         # --- Strategy 4: ThriveCart product name parsing ---
-        product_name = ""
+        # ThriveCart encodes the plan in the Stripe *price ID*, e.g.
+        #   thrivecart-20196-product-572-100000-month-aud11rebills
+        # On this account price.nickname is null on every price, so the previous
+        # version of this strategy (nickname / product / metadata only) could never
+        # match and every plan without tc_fixed_rebills fell through to "1 payment".
+        # Search the price ID first, then the older sources, and accept any currency
+        # code — GBP plans (…gbp11rebills) were also being missed.
         items_data = sub.get("items", {}).get("data", [])
+        candidates = []
         if items_data:
-            product_name = (
-                items_data[0].get("price", {}).get("product", {})
-                if isinstance(items_data[0].get("price", {}).get("product"), dict)
-                else ""
+            price_obj = items_data[0].get("price", {}) or {}
+            candidates.append(price_obj.get("id", ""))
+            product = price_obj.get("product")
+            candidates.append(product if isinstance(product, str) else "")
+            candidates.append(price_obj.get("nickname", "") or "")
+        candidates.append(metadata.get("tc_product_name", "") or "")
+        candidates.append(metadata.get("product_name", "") or "")
+
+        tc_name_match = None
+        product_name = ""
+        for candidate in candidates:
+            if not candidate:
+                continue
+            tc_name_match = _re.search(
+                r"thrivecart-[\w-]+?-(?P<cents>\d+)-(?:\w+?)-(?P<currency>[a-z]{3})(?P<rebills>\d+)rebills",
+                str(candidate),
+                _re.IGNORECASE,
             )
-            if not product_name:
-                product_name = (
-                    items_data[0].get("price", {}).get("nickname", "") or
-                    metadata.get("tc_product_name", "") or
-                    metadata.get("product_name", "")
-                )
-        tc_name_match = _re.search(
-            r"thrivecart-[\w-]+-(?P<cents>\d+)-(?:\w+)-aud(?P<rebills>\d+)rebills",
-            str(product_name),
-            _re.IGNORECASE,
-        )
+            if tc_name_match:
+                product_name = candidate
+                break
         if tc_name_match:
             try:
                 name_amount = int(tc_name_match.group("cents")) / 100.0
@@ -1423,7 +1515,7 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple:
                 total_amount = effective_amount * num_payments
                 logger.info(
                     f"Subscription {subscription_id}: {num_payments} payments via "
-                    f"ThriveCart product name (amount={effective_amount}) [fallback]"
+                    f"ThriveCart plan string {product_name!r} (amount={effective_amount}) [fallback]"
                 )
                 return num_payments, total_amount, False
             except (ValueError, TypeError) as e:
@@ -1516,10 +1608,16 @@ def handle_stripe_payment(event: dict):
                 f"Subsequent instalment payment ignored to preserve original sale data."
             )
             return
-        sheets_update_cell(row_num, "I", f"${amount_aud:,.2f}")
-        sheets_update_cell(row_num, "J", str(num_payments))
-        sheets_update_cell(row_num, "K", f"${contracted_revenue_aud:,.2f}")
-        sheets_update_cell(row_num, "R", payment_date)
+        # Write bare numbers (no "$", no thousands separator) and an ISO date with
+        # USER_ENTERED, so Sheets stores real numeric/date values that the column's
+        # own currency/date format then renders. Writing "$1,000.00" as RAW stored
+        # text, which is what forced manual retyping of every sale.
+        sheets_update_range(
+            row_num, "I",
+            [f"{amount_aud:.2f}", str(num_payments), f"{contracted_revenue_aud:.2f}"],
+            value_input_option="USER_ENTERED",
+        )
+        sheets_update_cell(row_num, "R", payment_date, value_input_option="USER_ENTERED")
         logger.info(f"Updated Stripe payment for {customer_email} at row {row_num} (purchase date: {payment_date})")
 
         # Validate: flag row red if Date of Purchase is before Appointment Date
@@ -3629,7 +3727,7 @@ async def health():
 async def root():
     return {
         "service": "GHL + Stripe + Fathom Webhook Receiver",
-        "version": "1.7.1",
+        "version": "1.8.0",
         "stripe_webhook_endpoint": "POST /stripe-webhook",
         "fathom_webhook_endpoint": "POST /fathom-webhook",
         "triage_booked_endpoint": "POST /triage-booked",
