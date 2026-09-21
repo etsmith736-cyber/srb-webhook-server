@@ -59,6 +59,12 @@ STRIPE_API_KEY        = os.environ.get("STRIPE_API_KEY",        "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 GOOGLE_SA_JSON        = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
+# Payments at or below this amount (AUD) are front-end products — the $7 VIP,
+# $27 workshop upsells and similar — not coaching sales. They must never be
+# written into the sales columns, because once Cash Collected holds a value the
+# row is treated as sold and the real coaching payment is skipped.
+FRONT_END_MAX_AUD     = float(os.environ.get("FRONT_END_MAX_AUD", "100"))
+
 # Zoom Server-to-Server OAuth
 ZOOM_ACCOUNT_ID       = os.environ.get("ZOOM_ACCOUNT_ID",       "")
 ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
@@ -958,7 +964,17 @@ def handle_opportunity_won(body: dict):
                 if charge.status == "succeeded" and charge.paid:
                     currency = charge.currency
                     exchange_rate = get_exchange_rate(currency, "AUD")
-                    amount_aud = (charge.amount / 100.0) * exchange_rate
+                    charge_aud = (charge.amount / 100.0) * exchange_rate
+                    # Skip front-end products ($7 VIP and similar): picking one up
+                    # here records a $7 "sale" and then blocks the real coaching
+                    # payment, because Cash Collected is no longer empty.
+                    if charge_aud <= FRONT_END_MAX_AUD:
+                        logger.info(
+                            f"Ignoring front-end charge of {charge_aud:.2f} AUD for {email} "
+                            f"while looking for a coaching sale"
+                        )
+                        continue
+                    amount_aud = charge_aud
                     num_payments = 1
                     contracted_revenue_aud = amount_aud
                     found_data = True
@@ -1546,6 +1562,68 @@ def get_stripe_subscription_details(subscription_id: str) -> tuple:
         return 1, 0.0, False
 
 
+def find_plan_subscription_for_charge(
+    customer_id: str,
+    amount_paid: float,
+    currency: str,
+    charge_created: int,
+) -> Optional[str]:
+    """
+    Find the payment plan behind a bare charge.
+
+    ThriveCart takes the first instalment of a payment plan as a plain charge
+    with no invoice attached, so the webhook payload carries no subscription and
+    the payment used to be recorded as "1 payment" at the amount paid. The plan
+    does exist on the customer, so look it up there.
+
+    Matching is deliberately strict — same currency, per-cycle amount equal to
+    the amount just paid, and created within SUB_MATCH_WINDOW_SECONDS of the
+    charge — so an older or unrelated plan on a returning customer is never
+    attached to a new sale. Returns None when there is no convincing match, in
+    which case the caller correctly records a single payment (a real pay-in-full
+    or a deposit).
+    """
+    SUB_MATCH_WINDOW_SECONDS = 3 * 24 * 60 * 60
+    CANCELLED_STATUSES = {"canceled", "incomplete_expired"}
+
+    if not STRIPE_API_KEY or not customer_id or amount_paid <= 0:
+        return None
+
+    try:
+        subs = stripe.Subscription.list(customer=customer_id, status="all", limit=20)
+    except Exception as e:
+        logger.warning(f"Could not list subscriptions for {customer_id}: {e}")
+        return None
+
+    best_id = None
+    best_gap = None
+    for sub in subs.data:
+        if sub.get("status") in CANCELLED_STATUSES:
+            continue
+        if (sub.get("currency") or "").lower() != (currency or "").lower():
+            continue
+
+        per_cycle = 0.0
+        for item in sub.get("items", {}).get("data", []):
+            price = item.get("price", {}) or {}
+            per_cycle += (price.get("unit_amount", 0) / 100.0) * item.get("quantity", 1)
+        if abs(per_cycle - amount_paid) > 0.01:
+            continue
+
+        gap = abs(int(sub.get("created", 0)) - int(charge_created or 0))
+        if gap > SUB_MATCH_WINDOW_SECONDS:
+            continue
+        if best_gap is None or gap < best_gap:
+            best_id, best_gap = sub.get("id"), gap
+
+    if best_id:
+        logger.info(
+            f"Matched charge of {amount_paid:.2f} {currency.upper()} to plan {best_id} "
+            f"for customer {customer_id} (created {best_gap}s apart)"
+        )
+    return best_id
+
+
 def handle_stripe_payment(event: dict):
     """Process a successful Stripe payment."""
     data_object = event["data"]["object"]
@@ -1593,9 +1671,26 @@ def handle_stripe_payment(event: dict):
     exchange_rate = get_exchange_rate(currency, "AUD")
     amount_aud    = amount_paid * exchange_rate
 
+    # Front-end products ($7 VIP and similar) are not coaching sales. Writing one
+    # into Cash Collected marks the row as sold and permanently blocks the real
+    # coaching payment from ever being recorded.
+    if amount_aud <= FRONT_END_MAX_AUD:
+        logger.info(
+            f"Ignoring front-end payment of {amount_aud:.2f} AUD from {customer_email} "
+            f"(<= FRONT_END_MAX_AUD={FRONT_END_MAX_AUD:.2f}) — not a coaching sale. ID: {stripe_payment_id}"
+        )
+        return
+
     num_payments           = 1
     contracted_revenue_aud = amount_aud
     is_primary             = True
+
+    # A payment plan's first instalment arrives as a bare charge with no invoice,
+    # so resolve the plan from the customer before falling back to "1 payment".
+    if not subscription_id:
+        subscription_id = find_plan_subscription_for_charge(
+            data_object.get("customer"), amount_paid, currency, stripe_created
+        )
 
     if subscription_id:
         payments, total_rev, is_primary = get_stripe_subscription_details(subscription_id)
