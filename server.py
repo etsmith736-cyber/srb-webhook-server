@@ -1754,6 +1754,127 @@ def handle_stripe_payment(event: dict):
     else:
         pass  # No matching row — unmatched payment handling to be built later
 
+
+def handle_subscription_created(event: dict):
+    """
+    Correct a row that was written as a single payment when it is really the first
+    instalment of a payment plan.
+
+    ThriveCart charges the first instalment BEFORE it creates the Stripe
+    subscription — observed gap ~6 seconds. charge.succeeded therefore arrives
+    while the customer still has no subscription, so no amount of plan-matching on
+    the charge can see the plan, and the row is written as 1 payment. The
+    subscription's own first invoice is $0 (it is created in trial), so no later
+    invoice event carries the plan either. customer.subscription.created is the only
+    event that knows the truth, and it arrives after the row is already written.
+
+    This handler is deliberately narrow. It only ever touches Number of Payments (J)
+    and Contracted Revenue (K), only when the existing Cash Collected equals one
+    cycle of this plan, and only when Payments currently reads 1 or is blank.
+    Cash Collected and Date of Purchase are never modified, so a plan instalment can
+    never be mistaken for extra cash.
+    """
+    sub = event["data"]["object"]
+    subscription_id = sub.get("id")
+    customer_id     = sub.get("customer")
+
+    num_payments, total_amount, _is_primary = get_stripe_subscription_details(subscription_id)
+    if num_payments <= 1:
+        logger.info(
+            f"Subscription {subscription_id}: reads as a single payment, nothing to correct"
+        )
+        return
+
+    per_cycle_amount = total_amount / num_payments if num_payments else 0.0
+    currency         = (sub.get("currency") or "aud").lower()
+    exchange_rate    = get_exchange_rate(currency, "AUD")
+    per_cycle_aud    = per_cycle_amount * exchange_rate
+    total_aud        = total_amount * exchange_rate
+
+    customer_email = None
+    try:
+        customer = stripe.Customer.retrieve(customer_id)
+        customer_email = (customer.get("email") or "").strip().lower()
+    except Exception as e:
+        logger.error(f"Subscription {subscription_id}: could not retrieve customer {customer_id}: {e}")
+        return
+    if not customer_email:
+        logger.warning(f"Subscription {subscription_id}: customer {customer_id} has no email")
+        return
+
+    row_num = find_row_by_email(customer_email)
+    if not row_num:
+        logger.info(
+            f"Subscription {subscription_id}: no Sales Calls row for {customer_email} — nothing to correct"
+        )
+        return
+
+    all_rows = sheets_read_all()
+    row_data = all_rows[row_num - 1] if row_num - 1 < len(all_rows) else []
+
+    def _cell(name: str) -> str:
+        idx = COL[name]
+        return row_data[idx].strip() if len(row_data) > idx else ""
+
+    existing_cash_raw     = _cell("Cash Collected (AUD)")
+    existing_payments_raw = _cell("Number of Payments")
+
+    if not existing_cash_raw:
+        logger.info(
+            f"Subscription {subscription_id}: row {row_num} ({customer_email}) has no Cash Collected yet — "
+            f"leaving it to the payment webhook"
+        )
+        return
+
+    try:
+        existing_cash = float(_strip_currency_text(existing_cash_raw))
+    except (ValueError, TypeError):
+        logger.warning(
+            f"Subscription {subscription_id}: row {row_num} Cash Collected "
+            f"('{existing_cash_raw}') is not a number — not touching it"
+        )
+        return
+
+    existing_payments = None
+    if existing_payments_raw:
+        try:
+            existing_payments = int(float(_strip_currency_text(existing_payments_raw)))
+        except (ValueError, TypeError):
+            logger.warning(
+                f"Subscription {subscription_id}: row {row_num} Number of Payments "
+                f"('{existing_payments_raw}') is not a number — not touching it"
+            )
+            return
+
+    if existing_payments is not None and existing_payments > 1:
+        logger.info(
+            f"Subscription {subscription_id}: row {row_num} ({customer_email}) already shows "
+            f"{existing_payments} payments — already correct, leaving it alone"
+        )
+        return
+
+    # The row must hold exactly one cycle of THIS plan. Anything else (a deposit, a
+    # pay-in-full, a different product) is not ours to rewrite.
+    if abs(existing_cash - per_cycle_aud) > 0.01:
+        logger.info(
+            f"Subscription {subscription_id}: row {row_num} ({customer_email}) shows "
+            f"{existing_cash:.2f} AUD but one cycle of this plan is {per_cycle_aud:.2f} AUD — "
+            f"not a first instalment, leaving it alone"
+        )
+        return
+
+    sheets_update_range(
+        row_num, "J",
+        [str(num_payments), f"{total_aud:.2f}"],
+        value_input_option="USER_ENTERED",
+    )
+    logger.info(
+        f"Backfilled payment plan for {customer_email} at row {row_num} from subscription "
+        f"{subscription_id}: Number of Payments 1 → {num_payments}, "
+        f"Contracted Revenue {existing_cash:.2f} → {total_aud:.2f} AUD "
+        f"(Cash Collected left at {existing_cash:.2f})"
+    )
+
 # ─── Webhook Endpoints ────────────────────────────────────────
 
 @app.post("/stripe-webhook")
@@ -1776,6 +1897,10 @@ async def stripe_webhook(request: Request):
 
     if event["type"] in ["payment_intent.succeeded", "invoice.payment_succeeded", "charge.succeeded"]:
         handle_stripe_payment(event)
+    elif event["type"] == "customer.subscription.created":
+        # Already enabled on the Stripe endpoint but previously ignored. It is the
+        # only event that knows a charge was a payment plan's first instalment.
+        handle_subscription_created(event)
 
     return JSONResponse(content={"status": "success"}, status_code=200)
 
