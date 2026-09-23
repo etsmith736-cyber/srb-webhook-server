@@ -249,6 +249,23 @@ def extract_field(body: dict, *keys: str, default: str = "") -> str:
     return default
 
 
+def extract_email_and_phone(body: dict) -> tuple:
+    """Return (email, phone) for a GHL event, falling back to the contact API.
+
+    Both are needed so row lookup can fall back to the phone number when the
+    sheet's email is typo'd (see find_row_by_email).
+    """
+    email = extract_field(body, "email")
+    phone = extract_field(body, "phone")
+    if not (email and phone):
+        contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
+        if contact_id:
+            contact = ghl_get_contact(contact_id)
+            email = email or str(contact.get("email") or "").strip()
+            phone = phone or str(contact.get("phone") or "").strip()
+    return email, phone
+
+
 def extract_tags(body: dict) -> list[str]:
     """Extract contact tags from any location in the payload."""
     for source in (body, body.get("customData", {}) or {}, body.get("contact", {}) or {}):
@@ -524,11 +541,31 @@ def sheets_read_cell(row: int, col: str, tab: str = "Sales Calls") -> str:
         return ""
 
 
-def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int = None) -> Optional[int]:
-    """Return 1-based row number for an email match in the specified tab, or None."""
+def phone_key(phone: str) -> str:
+    """Last 9 digits of a phone number — the comparable part across formats
+    (+61 4xx / 04xx / 61 4xx all reduce to the same key). Returns '' if the
+    number has fewer than 9 digits."""
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    return digits[-9:] if len(digits) >= 9 else ""
+
+
+def find_row_by_email(
+    email: str,
+    tab: str = "Sales Calls",
+    email_col_idx: int = None,
+    phone: str = "",
+) -> Optional[int]:
+    """Return the 1-based row number for a contact in the given tab, or None.
+
+    Matches on email first. If the email is not found and a `phone` is supplied,
+    falls back to matching the last 9 digits of the Phone column — sheet rows are
+    often typed by hand and carry email typos (gnail.com, oitlook.com), which used
+    to make the webhook silently skip the row. The fallback only fires on a single
+    unambiguous phone match, and always logs, so drift stays visible.
+    """
     if email_col_idx is None:
         email_col_idx = COL["Email"] if tab == "Sales Calls" else TRIAGE_COL["Email"]
-        
+
     range_str = "A:R" if tab == "Sales Calls" else "A:N"
     rows = sheets_read_all(tab, range_str)
     email_lower = email.strip().lower()
@@ -537,6 +574,33 @@ def find_row_by_email(email: str, tab: str = "Sales Calls", email_col_idx: int =
             continue  # skip header
         if len(row) > email_col_idx and row[email_col_idx].strip().lower() == email_lower:
             return i + 1
+
+    key = phone_key(phone)
+    if not key:
+        return None
+
+    phone_col_idx = COL["Phone"] if tab == "Sales Calls" else TRIAGE_COL["Phone"]
+    matches = [
+        i + 1
+        for i, row in enumerate(rows)
+        if i > 0 and len(row) > phone_col_idx and phone_key(row[phone_col_idx]) == key
+    ]
+    if len(matches) == 1:
+        row_num = matches[0]
+        sheet_email = ""
+        row = rows[row_num - 1]
+        if len(row) > email_col_idx:
+            sheet_email = row[email_col_idx].strip()
+        logger.warning(
+            f"PHONE FALLBACK: no {tab} row for {email_lower}; matched row {row_num} "
+            f"on phone {key} (sheet email '{sheet_email}') — the sheet email looks wrong, fix it"
+        )
+        return row_num
+    if len(matches) > 1:
+        logger.warning(
+            f"PHONE FALLBACK: no {tab} row for {email_lower} and phone {key} matches "
+            f"{len(matches)} rows {matches} — ambiguous, not updating"
+        )
     return None
 
 
@@ -880,19 +944,14 @@ def fathom_sales_call_recording_value(row_number: int) -> str:
 
 def handle_opportunity_won(body: dict):
     """Handle an opportunity stage change to 'Won (Closed)'."""
-    email = extract_field(body, "email")
-    if not email:
-        contact_id = extract_field(body, "contact_id", "contactId")
-        if contact_id:
-            contact = ghl_get_contact(contact_id)
-            email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found for opportunity won event — cannot locate row")
         return
 
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update Closed status")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update Closed status")
         return
 
     # 1. Mark column G as "Showed" and column H as "Closed"
@@ -1002,19 +1061,14 @@ def handle_opportunity_won(body: dict):
 
 def handle_pipeline_lost(body: dict):
     """Handle pipeline stage moved to Lost — update Closed column to No."""
-    email = extract_field(body, "email")
-    if not email:
-        contact_id = extract_field(body, "contact_id", "contactId")
-        if contact_id:
-            contact = ghl_get_contact(contact_id)
-            email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found for pipeline_lost event — cannot locate row")
         return
 
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update pipeline stage")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update pipeline stage")
         return
 
     sheets_update_cell(existing_row, "G", "Showed")
@@ -1027,16 +1081,13 @@ def handle_pipeline_no_show(body: dict):
     underlying GHL appointment as 'noshow' so the record survives any future
     stage moves (e.g. rep bulk-moving No-Show → Long Term Follow Up)."""
     contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
-    email = extract_field(body, "email")
-    if not email and contact_id:
-        contact = ghl_get_contact(contact_id)
-        email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found — cannot update No-Show")
         return
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update No-Show")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update No-Show")
         return
     sheets_update_cell(existing_row, "G", "No-Show")
     sheets_update_cell(existing_row, "H", "No-Show")
@@ -1058,17 +1109,13 @@ def handle_pipeline_decision_pending(body: dict):
     A rep moving an existing no-show into LTF/Decision-Pending shouldn't destroy
     the no-show record — the appointment truly didn't happen.
     """
-    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
-    email = extract_field(body, "email")
-    if not email and contact_id:
-        contact = ghl_get_contact(contact_id)
-        email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found — cannot update Decision Pending")
         return
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update Decision Pending")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update Decision Pending")
         return
 
     current_showed = sheets_read_cell(existing_row, "G")
@@ -1083,17 +1130,13 @@ def handle_pipeline_decision_pending(body: dict):
 
 def handle_pipeline_cancelled(body: dict):
     """Handle pipeline stage change to Cancelled — update G and H in Sales Calls."""
-    contact_id = extract_field(body, "contact_id", "contactId", "contact.id")
-    email = extract_field(body, "email")
-    if not email and contact_id:
-        contact = ghl_get_contact(contact_id)
-        email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found — cannot update Cancelled")
         return
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update Cancelled")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update Cancelled")
         return
     sheets_update_cell(existing_row, "G", "Cancelled")
     sheets_update_cell(existing_row, "H", "Cancelled")
@@ -1359,18 +1402,14 @@ def handle_appointment_status(body: dict):
         logger.info(f"Status '{status}' not in STATUS_MAP — ignoring")
         return
 
-    email = extract_field(body, "email")
-    if not email and contact_id:
-        logger.info(f"Email not in payload — fetching from GHL API for contact {contact_id}")
-        contact = ghl_get_contact(contact_id)
-        email = contact.get("email", "").strip()
+    email, phone = extract_email_and_phone(body)
     if not email:
         logger.warning("No email found — cannot locate row to update")
         return
 
-    existing_row = find_row_by_email(email)
+    existing_row = find_row_by_email(email, phone=phone)
     if not existing_row:
-        logger.warning(f"No row found for {email} — cannot update Showed")
+        logger.warning(f"No row found for {email} / phone {phone} — cannot update Showed")
         return
 
     # Update Showed column (G) always
