@@ -345,10 +345,22 @@ def ghl_mark_latest_appointment_noshow(contact_id: str) -> tuple[bool, str]:
     now = datetime.now(timezone.utc)
 
     def parse_iso(s):
+        """Parse a GHL appointment timestamp into an aware UTC-comparable datetime.
+
+        GHL v2 returns `startTime` as a NAIVE local string ("2026-09-25 11:30:00",
+        no offset, in the calendar's timezone). Comparing that to an aware `now`
+        raises "can't compare offset-naive and offset-aware datetimes", which
+        crashed this whole handler — and with it the pipeline No-Show webhook —
+        on every single call. Naive values are therefore localised to the account
+        timezone (Adelaide) before comparison.
+        """
         try:
-            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         except Exception:
             return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=AEST)
+        return parsed
 
     past_events = []
     for e in events:
@@ -1042,9 +1054,15 @@ def handle_pipeline_no_show(body: dict):
     sheets_update_cell(existing_row, "H", "No-Show")
     logger.info(f"Pipeline No-Show: updated G='No-Show', H='No-Show' for {email} at row {existing_row}")
 
-    # Also mark the underlying GHL appointment noshow so it's durable.
+    # Also mark the underlying GHL appointment noshow so it's durable. This is a
+    # best-effort side effect: the sheet is already written, so a failure here must
+    # never turn the webhook into a 500 (GHL then marks the workflow action Failed
+    # and retries it every few minutes, rewriting the same cells each time).
     if contact_id:
-        ok, msg = ghl_mark_latest_appointment_noshow(contact_id)
+        try:
+            ok, msg = ghl_mark_latest_appointment_noshow(contact_id)
+        except Exception as e:  # pragma: no cover - defensive
+            ok, msg = False, f"unexpected error: {e}"
         if ok:
             logger.info(f"GHL appointment noshow sync for {email}: {msg}")
         else:
