@@ -32,6 +32,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import threading
@@ -574,6 +575,115 @@ def sheets_append_row(values: list[str], tab: str = "Sales Calls", value_input_o
         logger.error(f"Failed to append row to {tab}: {e}")
 
 
+MONEY_COLUMNS = ("I", "K")          # Cash Collected (AUD), Contracted Revenue (AUD)
+CURRENCY_PATTERN = '"$"#,##0.00'
+_sales_calls_sheet_id = None
+
+
+def _get_sheet_id(tab: str = "Sales Calls"):
+    """Resolve and cache the numeric sheetId for a tab (needed by batchUpdate)."""
+    global _sales_calls_sheet_id
+    if tab == "Sales Calls" and _sales_calls_sheet_id is not None:
+        return _sales_calls_sheet_id
+    service = get_sheets_service()
+    if not service:
+        return None
+    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for s in meta.get("sheets", []):
+        props = s.get("properties", {})
+        if props.get("title") == tab:
+            sheet_id = props.get("sheetId")
+            if tab == "Sales Calls":
+                _sales_calls_sheet_id = sheet_id
+            return sheet_id
+    return None
+
+
+def ensure_currency_format(row_number: int, tab: str = "Sales Calls"):
+    """Force the AUD currency number format onto the money cells (I and K) of a row.
+
+    Rows created by values().append(insertDataOption="INSERT_ROWS") do NOT inherit
+    the column's number format, so correct numeric values render as a bare `1000`
+    instead of `$1,000.00`. Applying the format per row after every money write is
+    the only thing that holds — a column-wide format gets bypassed by new rows.
+    Display only: it never changes a stored value. Best effort, never raises.
+    """
+    if tab != "Sales Calls" or not row_number:
+        return
+    try:
+        service = get_sheets_service()
+        sheet_id = _get_sheet_id(tab)
+        if not service or sheet_id is None:
+            return
+        row_index = int(row_number) - 1
+        requests = [
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": row_index,
+                        "endRowIndex": row_index + 1,
+                        "startColumnIndex": ord(col) - ord("A"),
+                        "endColumnIndex": ord(col) - ord("A") + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "CURRENCY",
+                                "pattern": CURRENCY_PATTERN,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+            for col in MONEY_COLUMNS
+        ]
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body={"requests": requests},
+        ).execute()
+        logger.info(f"Currency format applied to I{row_number}/K{row_number} in {tab}")
+    except Exception as e:
+        logger.error(f"Failed to apply currency format to row {row_number}: {e}")
+
+
+def _touches_money(start_col: str, value_count: int) -> bool:
+    """True if a write starting at start_col and spanning value_count columns
+    covers column I or K."""
+    try:
+        start = ord(start_col.upper()) - ord("A")
+    except (TypeError, ValueError):
+        return False
+    end = start + max(int(value_count), 1) - 1
+    return any(start <= (ord(c) - ord("A")) <= end for c in MONEY_COLUMNS)
+
+
+def _money_rows_in_updates(updates: list) -> list:
+    """Row numbers touched by a batch write that covers column I or K.
+    Ranges look like 'U10:X10', 'I42' or 'AI7:AJ7'."""
+    rows = []
+    for u in updates or []:
+        rng = str(u.get("range", ""))
+        cells = rng.split(":")
+        parsed = []
+        for cell in cells:
+            m = re.match(r"^([A-Za-z]+)(\d+)$", cell.strip())
+            if m:
+                parsed.append((m.group(1).upper(), int(m.group(2))))
+        if not parsed:
+            continue
+        start_col, row_number = parsed[0]
+        end_col = parsed[-1][0] if len(parsed) > 1 else start_col
+        if len(start_col) > 1 or len(end_col) > 1:
+            # AA+ columns are never money columns
+            if not any(len(c) == 1 for c in (start_col, end_col)):
+                continue
+        span = ord(end_col[-1]) - ord(start_col[-1]) + 1 if len(start_col) == 1 and len(end_col) == 1 else 1
+        if len(start_col) == 1 and _touches_money(start_col, span) and row_number not in rows:
+            rows.append(row_number)
+    return rows
+
+
 def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Calls", value_input_option: str = "RAW"):
     """Overwrite an existing row (1-based) in the specified tab."""
     service = get_sheets_service()
@@ -589,6 +699,8 @@ def sheets_update_row(row_number: int, values: list[str], tab: str = "Sales Call
             body={"values": [values]},
         ).execute()
         logger.info(f"Row {row_number} updated successfully in {tab}")
+        if _touches_money("A", len(values)):
+            ensure_currency_format(row_number, tab)
     except HttpError as e:
         logger.error(f"Sheets update error for {tab}: {e}")
     except Exception as e:
@@ -609,6 +721,8 @@ def sheets_update_cell(row_number: int, col_letter: str, value: str, tab: str = 
             body={"values": [[value]]},
         ).execute()
         logger.info(f"Cell {col_letter}{row_number} updated to '{value}' in {tab}")
+        if str(col_letter).upper() in MONEY_COLUMNS:
+            ensure_currency_format(row_number, tab)
     except HttpError as e:
         logger.error(f"Sheets cell update error for {tab}: {e}")
     except Exception as e:
@@ -630,6 +744,8 @@ def sheets_update_range(row_number: int, start_col: str, values: list, tab: str 
             body={"values": [values]},
         ).execute()
         logger.info(f"Range {start_col}{row_number}:{end_col}{row_number} updated in {tab}")
+        if _touches_money(start_col, len(values)):
+            ensure_currency_format(row_number, tab)
     except HttpError as e:
         logger.error(f"Sheets range update error for {tab}: {e}")
     except Exception as e:
@@ -660,6 +776,8 @@ def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls") -> tuple
         ).execute()
         total = result.get("totalUpdatedCells", 0)
         logger.info(f"Batch updated {len(data)} ranges in {tab}: {total} cells written")
+        for row_number in _money_rows_in_updates(updates):
+            ensure_currency_format(row_number, tab)
         return True, ""
     except HttpError as e:
         msg = f"Batch update HttpError for {tab}: {e}"
@@ -1277,6 +1395,11 @@ def handle_appointment_created(body: dict):
         logger.info(f"New contact {email} — appending row")
         sheets_append_row(row)
         target_row = find_row_by_email(email)
+        # A row created by append(insertDataOption="INSERT_ROWS") inherits no number
+        # format, so stamp the money columns straight away — even while they are still
+        # empty — and any later money write lands already formatted.
+        if target_row:
+            ensure_currency_format(target_row)
 
     # The row itself is written RAW because USER_ENTERED strips the leading "+" from
     # phone numbers. Re-write only the date and money columns with USER_ENTERED so
