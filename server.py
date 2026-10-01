@@ -66,6 +66,21 @@ GOOGLE_SA_JSON        = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 # row is treated as sold and the real coaching payment is skipped.
 FRONT_END_MAX_AUD     = float(os.environ.get("FRONT_END_MAX_AUD", "100"))
 
+# Deposits (Sales Calls columns AI / AJ).
+#
+# Sofia sells a holding deposit (SCALE SCHOOL DEPOSIT, SCALE SCHOOL MASTERMIND
+# DEPOSIT, and a $100 variant) that is NOT a sale: the program purchase follows
+# days later. Writing a deposit into Cash Collected both invented a $250 "close"
+# — skewing average cash and contracted revenue — and blocked the real purchase,
+# because the payment path skips any row whose Cash Collected is already filled.
+#
+# Every deposit SKU carries the word DEPOSIT in its product name, so deposits are
+# classified by NAME, never by amount: the $100 deposit is indistinguishable from
+# a front-end product by price alone.
+DEPOSIT_COL           = "AI"   # Deposit (AUD)
+DEPOSIT_DATE_COL      = "AJ"   # Deposit Date
+DEPOSIT_NAME_PATTERN  = re.compile(r"\bdeposits?\b", re.IGNORECASE)
+
 # Zoom Server-to-Server OAuth
 ZOOM_ACCOUNT_ID       = os.environ.get("ZOOM_ACCOUNT_ID",       "")
 ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
@@ -816,7 +831,7 @@ def sheets_update_range(row_number: int, start_col: str, values: list, tab: str 
         logger.error(f"Failed to update range {start_col}{row_number}:{end_col}{row_number}: {e}")
 
 
-def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls") -> tuple[bool, str]:
+def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls", value_input_option: str = "RAW") -> tuple[bool, str]:
     """
     Write multiple ranges to the same tab in a single API call.
     updates: list of {'range': 'U10:X10', 'values': [['a','b','c','d']]}
@@ -836,7 +851,7 @@ def sheets_batch_update_ranges(updates: list, tab: str = "Sales Calls") -> tuple
     try:
         result = service.spreadsheets().values().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
-            body={"valueInputOption": "RAW", "data": data},
+            body={"valueInputOption": value_input_option, "data": data},
         ).execute()
         total = result.get("totalUpdatedCells", 0)
         logger.info(f"Batch updated {len(data)} ranges in {tab}: {total} cells written")
@@ -868,6 +883,73 @@ def _strip_currency_text(value: str) -> str:
         return cleaned
     except ValueError:
         return v
+
+
+def deposit_product_name(event_type: str, data_object: dict) -> str:
+    """Collect every product-name-ish string on a Stripe payment event.
+
+    charge.succeeded and payment_intent.succeeded carry the ThriveCart product in
+    `description` ("Purchase of SCALE SCHOOL MASTERMIND DEPOSIT ($250 AUD) via
+    ThriveCart"); an invoice carries it on its line items instead.
+    """
+    parts = [
+        data_object.get("description") or "",
+        data_object.get("statement_descriptor") or "",
+    ]
+    lines = (data_object.get("lines") or {}).get("data") or []
+    for line in lines:
+        parts.append(line.get("description") or "")
+        plan = line.get("plan") or {}
+        parts.append(plan.get("nickname") or "")
+    return " | ".join(p for p in parts if p)
+
+
+def is_deposit_payment(product_name: str) -> bool:
+    """True when the product is a holding deposit rather than a program sale."""
+    return bool(DEPOSIT_NAME_PATTERN.search(product_name or ""))
+
+
+def read_deposit_aud(row_number: int, tab: str = "Sales Calls") -> float:
+    """Deposit already logged on this row, in AUD. 0.0 when blank or unreadable."""
+    raw = sheets_read_cell(row_number, DEPOSIT_COL, tab=tab)
+    if not raw:
+        return 0.0
+    try:
+        return float(_strip_currency_text(raw))
+    except (ValueError, TypeError):
+        logger.warning(f"Deposit cell {DEPOSIT_COL}{row_number} ('{raw}') is not a number — treating as 0")
+        return 0.0
+
+
+def record_deposit(row_number: int, amount_aud: float, paid_date: str, email: str = "") -> None:
+    """Write a deposit to AI/AJ and nothing else.
+
+    A deposit is never cash collected, never a payment count, never contracted
+    revenue and never a date of purchase — those belong to the program purchase
+    that may follow. An existing deposit is left alone so a duplicate charge
+    cannot double it.
+    """
+    existing = sheets_read_cell(row_number, DEPOSIT_COL)
+    if existing:
+        logger.info(
+            f"Deposit of {amount_aud:.2f} AUD for {email} at row {row_number} ignored — "
+            f"{DEPOSIT_COL}{row_number} already holds '{existing}' (duplicate or second deposit)"
+        )
+        return
+    # USER_ENTERED so the amount lands as a real number and the date as a real
+    # date; RAW would store both as text and break every SUM and date filter.
+    ok, err = sheets_batch_update_ranges(
+        [{"range": f"{DEPOSIT_COL}{row_number}:{DEPOSIT_DATE_COL}{row_number}",
+          "values": [[f"{amount_aud:.2f}", paid_date]]}],
+        value_input_option="USER_ENTERED",
+    )
+    if ok:
+        logger.info(
+            f"Recorded deposit of {amount_aud:.2f} AUD ({paid_date}) for {email} at row {row_number} — "
+            f"sales columns deliberately left empty"
+        )
+    else:
+        logger.error(f"Failed to record deposit for {email} at row {row_number}: {err}")
 
 
 def sheets_read_row_formulas(row_number: int, tab: str = "Sales Calls") -> list[str]:
@@ -1154,6 +1236,14 @@ def handle_opportunity_won(body: dict):
                     currency = charge.currency
                     exchange_rate = get_exchange_rate(currency, "AUD")
                     charge_aud = (charge.amount / 100.0) * exchange_rate
+                    # A deposit is not the sale either — it is recorded in AI/AJ by
+                    # the payment webhook and must not become Cash Collected here.
+                    if is_deposit_payment(charge.get("description") if isinstance(charge, dict) else getattr(charge, "description", "")):
+                        logger.info(
+                            f"Ignoring deposit charge of {charge_aud:.2f} AUD for {email} "
+                            f"while looking for a coaching sale"
+                        )
+                        continue
                     # Skip front-end products ($7 VIP and similar): picking one up
                     # here records a $7 "sale" and then blocks the real coaching
                     # payment, because Cash Collected is no longer empty.
@@ -1851,6 +1941,21 @@ def handle_stripe_payment(event: dict):
     exchange_rate = get_exchange_rate(currency, "AUD")
     amount_aud    = amount_paid * exchange_rate
 
+    # Deposits are classified by product name and handled before anything else.
+    # They are not sales, and the $100 deposit would otherwise be swallowed by the
+    # front-end filter below.
+    product_name = deposit_product_name(event_type, data_object)
+    if is_deposit_payment(product_name):
+        deposit_row = find_row_by_email(customer_email)
+        if deposit_row:
+            record_deposit(deposit_row, amount_aud, payment_date, customer_email)
+        else:
+            logger.info(
+                f"Deposit of {amount_aud:.2f} AUD from {customer_email} has no Sales Calls row "
+                f"('{product_name}'). ID: {stripe_payment_id}"
+            )
+        return
+
     # Front-end products ($7 VIP and similar) are not coaching sales. Writing one
     # into Cash Collected marks the row as sold and permanently blocks the real
     # coaching payment from ever being recorded.
@@ -1899,13 +2004,30 @@ def handle_stripe_payment(event: dict):
                 f"Subsequent instalment payment ignored to preserve original sale data."
             )
             return
+        # A deposit already paid on this row is part of what the client has handed
+        # over, so it belongs in Cash Collected. It stays in AI/AJ as the record of
+        # what was paid and when.
+        deposit_aud = read_deposit_aud(row_num)
+        cash_aud    = amount_aud + deposit_aud
+        if deposit_aud:
+            if num_payments > 1:
+                # The plan total already carries the deposit (a "$750 today +
+                # $1,000 x 11" plan is sold as a $12,000 program), so only the
+                # cash figure moves.
+                contracted_revenue_aud = max(contracted_revenue_aud, cash_aud)
+            else:
+                contracted_revenue_aud = cash_aud
+            logger.info(
+                f"Adding deposit of {deposit_aud:.2f} AUD already on row {row_num} to this payment: "
+                f"Cash Collected {amount_aud:.2f} -> {cash_aud:.2f} AUD"
+            )
         # Write bare numbers (no "$", no thousands separator) and an ISO date with
         # USER_ENTERED, so Sheets stores real numeric/date values that the column's
         # own currency/date format then renders. Writing "$1,000.00" as RAW stored
         # text, which is what forced manual retyping of every sale.
         sheets_update_range(
             row_num, "I",
-            [f"{amount_aud:.2f}", str(num_payments), f"{contracted_revenue_aud:.2f}"],
+            [f"{cash_aud:.2f}", str(num_payments), f"{contracted_revenue_aud:.2f}"],
             value_input_option="USER_ENTERED",
         )
         sheets_update_cell(row_num, "R", payment_date, value_input_option="USER_ENTERED")
@@ -2034,8 +2156,16 @@ def handle_subscription_created(event: dict):
         return
 
     # The row must hold exactly one cycle of THIS plan. Anything else (a deposit, a
-    # pay-in-full, a different product) is not ours to rewrite.
-    if abs(existing_cash - per_cycle_aud) > 0.01:
+    # pay-in-full, a different product) is not ours to rewrite. When a deposit was
+    # paid first, Cash Collected is "first instalment + deposit", so the deposit is
+    # subtracted before the comparison — the remainder still has to be at most one
+    # cycle.
+    deposit_aud = read_deposit_aud(row_num)
+    cash_ex_deposit = existing_cash - deposit_aud
+    matches_cycle = abs(existing_cash - per_cycle_aud) <= 0.01 or (
+        deposit_aud > 0 and 0 < cash_ex_deposit <= per_cycle_aud + 0.01
+    )
+    if not matches_cycle:
         logger.info(
             f"Subscription {subscription_id}: row {row_num} ({customer_email}) shows "
             f"{existing_cash:.2f} AUD but one cycle of this plan is {per_cycle_aud:.2f} AUD — "
