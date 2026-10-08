@@ -2405,6 +2405,10 @@ async def thrivecart_webhook(request: Request):
     else:
         payload = parse_nested_form(raw)
 
+    if not payload.get("event"):
+        # ThriveCart's URL-validation POST carries no order — just acknowledge it.
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
     if not THRIVECART_SECRET:
         logger.error("THRIVECART_SECRET is not set — ThriveCart webhook rejected")
         return JSONResponse(content={"error": "Webhook secret not configured"}, status_code=500)
