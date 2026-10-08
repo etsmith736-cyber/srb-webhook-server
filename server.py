@@ -2187,6 +2187,239 @@ def handle_subscription_created(event: dict):
 
 # ─── Webhook Endpoints ────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# ThriveCart webhook — PayPal purchases
+# ---------------------------------------------------------------------------
+# Stripe purchases already reach the sheet through /stripe-webhook. Purchases a
+# buyer pays with PayPal never touch Stripe, so no Stripe event fires and the row
+# stays blank (row 1113 Kim Hamilton, A$10,000 Mastermind PIF, 8 Oct 2026). This
+# endpoint takes ThriveCart's own order notification and fills the row for any
+# order whose processor is NOT Stripe. Stripe orders are ignored here on purpose
+# so the two paths can never both write the same sale.
+#
+# ThriveCart posts application/x-www-form-urlencoded with nested keys
+# (customer[email], order[processor], order[charges][0][amount], ...). There is
+# no signature header — authenticity is the account's "secret word" echoed in
+# `thrivecart_secret`, compared against THRIVECART_SECRET.
+
+THRIVECART_SECRET = os.environ.get("THRIVECART_SECRET", "")
+THRIVECART_SALE_EVENTS = {"order.success"}
+
+_PAYMENT_COUNT_PATTERNS = [
+    re.compile(r"for\s+(\d{1,2})\s+(?:months?|payments?|instal(?:l)?ments?|weeks?)", re.IGNORECASE),
+    re.compile(r"(\d{1,2})\s+(?:monthly\s+)?(?:payments|instal(?:l)?ments)", re.IGNORECASE),
+    re.compile(r"(\d{1,2})\s*[x×]\s*\$", re.IGNORECASE),
+]
+_PIF_PATTERN = re.compile(r"pay(?:ment)?\s*in\s*full|\bPIF\b|one[- ]time", re.IGNORECASE)
+
+
+def parse_nested_form(raw: bytes) -> dict:
+    """Decode PHP-style nested form keys into dicts/lists:
+    'order[charges][0][amount]=100' -> {'order': {'charges': [{'amount': '100'}]}}."""
+    from urllib.parse import parse_qsl
+
+    root: dict = {}
+    for key, value in parse_qsl(raw.decode("utf-8", errors="replace"), keep_blank_values=True):
+        parts = re.findall(r"[^\[\]]+", key)
+        if not parts:
+            continue
+        node = root
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            if last:
+                node[part] = value
+            else:
+                node = node.setdefault(part, {})
+                if not isinstance(node, dict):
+                    break
+    return _dicts_to_lists(root)
+
+
+def _dicts_to_lists(node):
+    if isinstance(node, dict):
+        node = {k: _dicts_to_lists(v) for k, v in node.items()}
+        if node and all(str(k).isdigit() for k in node):
+            return [node[k] for k in sorted(node, key=int)]
+    return node
+
+
+def _tc_money(node: dict, key: str) -> float:
+    """ThriveCart amounts are integer cents; a `<key>_str` twin, when present,
+    is already in dollars and is preferred."""
+    if not isinstance(node, dict):
+        return 0.0
+    s = node.get(f"{key}_str")
+    if s not in (None, ""):
+        try:
+            return float(str(s).replace(",", ""))
+        except ValueError:
+            pass
+    v = node.get(key)
+    try:
+        return int(float(v)) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_list(v) -> list:
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return list(v.values())
+    return []
+
+
+def thrivecart_plan_text(payload: dict) -> str:
+    """Every product / pricing-option string on the order, joined for matching."""
+    order = payload.get("order") or {}
+    parts: list[str] = []
+    for charge in _as_list(order.get("charges")) + _as_list(order.get("future_charges")):
+        if isinstance(charge, dict):
+            for k in ("name", "payment_plan_name", "pricing_option_name", "item_pricing_option_name", "reference"):
+                if charge.get(k):
+                    parts.append(str(charge[k]))
+    for p in _as_list(payload.get("purchases")):
+        parts.append(str(p))
+    return " | ".join(parts)
+
+
+def thrivecart_payment_count(payload: dict, plan_text: str) -> tuple[int, bool]:
+    """(number_of_payments, confident). Pricing-option wording first
+    ("Payment Plan: $965 NZD Per Month For 14 Months", "Pay In Full: $10,000"),
+    then the shape of future_charges. Not confident -> caller highlights orange."""
+    for pat in _PAYMENT_COUNT_PATTERNS:
+        m = pat.search(plan_text or "")
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 36:
+                return n, True
+    if _PIF_PATTERN.search(plan_text or ""):
+        return 1, True
+    order = payload.get("order") or {}
+    future = [c for c in _as_list(order.get("future_charges")) if isinstance(c, dict)]
+    recurring = [c for c in _as_list(order.get("charges"))
+                 if isinstance(c, dict) and str(c.get("frequency", "single")).lower() not in ("", "single", "one-off")]
+    if not future and not recurring:
+        return 1, True
+    if len(future) > 1:
+        return 1 + len(future), False
+    return 1, False
+
+
+def handle_thrivecart_order(payload: dict) -> str:
+    """Write a non-Stripe ThriveCart sale (or deposit) to its Sales Calls row.
+    Returns a short status string for the response/logs."""
+    event = str(payload.get("event", ""))
+    order = payload.get("order") or {}
+    processor = str(order.get("processor", "")).lower()
+    customer = payload.get("customer") or {}
+    email = str(customer.get("email", "")).strip()
+    phone = str(customer.get("contactno") or customer.get("phone") or "").strip()
+    order_id = payload.get("order_id", "")
+
+    if event not in THRIVECART_SALE_EVENTS:
+        return f"ignored event {event or '?'}"
+    if str(payload.get("mode", "live")).lower() == "test" or str(payload.get("mode_int", "2")) == "1":
+        logger.info(f"ThriveCart test-mode order {order_id} ignored")
+        return "ignored test mode"
+    if processor == "stripe" or not processor:
+        # Stripe orders arrive via /stripe-webhook with plan detail from Stripe.
+        return f"ignored processor {processor or 'unknown'}"
+    if not email:
+        logger.warning(f"ThriveCart {processor} order {order_id} has no customer email")
+        return "no email"
+
+    currency = str(payload.get("currency") or "AUD").lower()
+    amount = _tc_money(order, "total")
+    if not amount:
+        amount = sum(_tc_money(c, "amount") for c in _as_list(order.get("charges")) if isinstance(c, dict))
+    rate = get_exchange_rate(currency, "AUD")
+    amount_aud = amount * rate
+    payment_date = datetime.now(AEST).strftime("%Y-%m-%d")
+    plan_text = thrivecart_plan_text(payload)
+
+    logger.info(
+        f"ThriveCart {processor} order {order_id}: {email}, {amount:.2f} {currency.upper()} "
+        f"({amount_aud:.2f} AUD), plan='{plan_text}'"
+    )
+
+    if is_deposit_payment(plan_text):
+        row = find_row_by_email(email, phone=phone)
+        if row:
+            record_deposit(row, amount_aud, payment_date, email)
+            return f"deposit row {row}"
+        logger.warning(f"UNMATCHED ThriveCart {processor} deposit {amount_aud:.2f} AUD from {email} (order {order_id})")
+        return "deposit unmatched"
+
+    if amount_aud <= FRONT_END_MAX_AUD:
+        return "ignored front-end"
+
+    num_payments, confident = thrivecart_payment_count(payload, plan_text)
+    contracted_aud = amount_aud * num_payments
+
+    row = find_row_by_email(email, phone=phone)
+    if not row:
+        logger.warning(
+            f"UNMATCHED ThriveCart {processor} sale {amount_aud:.2f} AUD from {email} "
+            f"(order {order_id}, '{plan_text}') — no Sales Calls row, add by hand"
+        )
+        return "sale unmatched"
+
+    existing = sheets_read_cell(row, "I")
+    if existing:
+        logger.info(f"ThriveCart order {order_id}: row {row} already has Cash Collected '{existing}' — not overwritten")
+        return f"row {row} already filled"
+
+    deposit_aud = read_deposit_aud(row)
+    cash_aud = amount_aud + deposit_aud
+    if deposit_aud:
+        contracted_aud = max(contracted_aud, cash_aud) if num_payments > 1 else cash_aud
+
+    sheets_update_range(
+        row, "I",
+        [f"{cash_aud:.2f}", str(num_payments), f"{contracted_aud:.2f}"],
+        value_input_option="USER_ENTERED",
+    )
+    sheets_update_cell(row, "R", payment_date, value_input_option="USER_ENTERED")
+    if not confident:
+        sheets_highlight_row(row, 1.0, 200 / 255, 100 / 255)  # orange = guessed plan, check it
+    logger.info(
+        f"ThriveCart {processor} sale written to row {row}: {cash_aud:.2f} / {num_payments} / "
+        f"{contracted_aud:.2f} AUD, DOP {payment_date}, confident_plan={confident}"
+    )
+    return f"sale row {row}"
+
+
+@app.api_route("/thrivecart-webhook", methods=["GET", "HEAD", "POST"])
+async def thrivecart_webhook(request: Request):
+    # ThriveCart validates a new webhook URL with HEAD (and POST) and needs a 2xx.
+    if request.method in ("GET", "HEAD"):
+        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+    raw = await request.body()
+    if "json" in (request.headers.get("content-type") or "").lower():
+        try:
+            payload = json.loads(raw or b"{}")
+        except ValueError:
+            return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
+    else:
+        payload = parse_nested_form(raw)
+
+    if not THRIVECART_SECRET:
+        logger.error("THRIVECART_SECRET is not set — ThriveCart webhook rejected")
+        return JSONResponse(content={"error": "Webhook secret not configured"}, status_code=500)
+    if not hmac.compare_digest(str(payload.get("thrivecart_secret", "")), THRIVECART_SECRET):
+        logger.error("ThriveCart webhook with wrong secret word rejected")
+        return JSONResponse(content={"error": "Invalid secret"}, status_code=401)
+
+    try:
+        status = handle_thrivecart_order(payload)
+    except Exception as e:  # never make ThriveCart retry-storm on our bug
+        logger.exception(f"ThriveCart webhook failed: {e}")
+        status = "error"
+    return JSONResponse(content={"status": status}, status_code=200)
+
+
 @app.post("/stripe-webhook")
 async def stripe_webhook(request: Request):
     payload    = await request.body()
@@ -4266,6 +4499,7 @@ async def health():
         "stripe_api_key":         "configured" if stripe_configured         else "MISSING — set STRIPE_API_KEY",
         "stripe_webhook_secret":  "configured" if stripe_webhook_configured else "MISSING — set STRIPE_WEBHOOK_SECRET",
         "fathom_webhook_secrets": f"{fathom_secrets_count} configured"      if fathom_secrets_count    else "MISSING — set FATHOM_WEBHOOK_SECRETS",
+        "thrivecart_secret":      "configured" if THRIVECART_SECRET         else "MISSING — set THRIVECART_SECRET",
     }
 
 
