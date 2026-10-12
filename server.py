@@ -2953,7 +2953,7 @@ async def webhook(request: Request):
             handle_pipeline_lost(body)
         elif "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
             handle_pipeline_no_show(body)
-        elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
+        elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name or "deposit paid" in stage_name:
             handle_pipeline_decision_pending(body)
         elif "cancelled" in stage_name or "canceled" in stage_name:
             handle_pipeline_cancelled(body)
@@ -2991,14 +2991,14 @@ async def webhook(request: Request):
             elif "no-show" in stage_name or "no show" in stage_name or "noshow" in stage_name:
                 logger.info(f"Implicit pipeline No-Show detected: stage='{stage_name}'")
                 handle_pipeline_no_show(body)
-            elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name:
-                logger.info(f"Implicit pipeline Decision Pending/Follow Up detected: stage='{stage_name}'")
+            elif "decision pending" in stage_name or "long term follow up" in stage_name or "follow up" in stage_name or "deposit paid" in stage_name:
+                logger.info(f"Implicit pipeline Decision Pending/Follow Up/Deposit Paid detected: stage='{stage_name}'")
                 handle_pipeline_decision_pending(body)
             elif "cancelled" in stage_name or "canceled" in stage_name:
                 logger.info(f"Implicit pipeline Cancelled detected: stage='{stage_name}'")
                 handle_pipeline_cancelled(body)
             else:
-                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost/No-Show/Decision Pending/Cancelled)")
+                logger.info(f"Ignoring pipeline event with stage='{stage_name}' (not Won/Closed/Lost/No-Show/Decision Pending/Deposit Paid/Cancelled)")
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         # --- Appointment status / created fallback ---
