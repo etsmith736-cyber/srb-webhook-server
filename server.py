@@ -909,6 +909,50 @@ def is_deposit_payment(product_name: str) -> bool:
     return bool(DEPOSIT_NAME_PATTERN.search(product_name or ""))
 
 
+# Column Z (Program). Values must match the sheet's existing four labels exactly.
+PROGRAM_COL = "Z"
+_PROGRAM_RULES = [
+    (re.compile(r"\bBOARDROOM\b", re.IGNORECASE),          "Scale School Boardroom"),
+    (re.compile(r"\bTIER\s*2\b", re.IGNORECASE),            "Scale School Tier 2"),
+    (re.compile(r"\bFOUNDATIONS?\b", re.IGNORECASE),        "Scale School Foundations"),
+    # Mastermind is sold as Tier 1 (Ethan's ruling, Oct 2026).
+    (re.compile(r"\bTIER\s*1\b|\bMASTERMIND\b", re.IGNORECASE), "Scale School Tier 1"),
+]
+
+
+def program_from_product(product_name: str) -> str:
+    """Map a ThriveCart/Stripe product string ("Purchase of SCALE SCHOOL MASTERMIND
+    (Abeer) via ThriveCart") to the sheet's Program label. '' when the product is a
+    deposit or not a recognised program (e.g. a 1:1 session) — never guess."""
+    text = product_name or ""
+    if not text or is_deposit_payment(text):
+        return ""
+    for pattern, label in _PROGRAM_RULES:
+        if pattern.search(text):
+            return label
+    return ""
+
+
+def record_program(row_number: int, product_name: str, tab: str = "Sales Calls") -> None:
+    """Fill column Z from the product name if it is blank. Never overwrites a value a
+    person has typed, and never raises — a failure here must not fail the webhook."""
+    try:
+        program = program_from_product(product_name)
+        if not program:
+            if product_name:
+                logger.info(f"Program not derivable from '{product_name}' (row {row_number}) — Z left as is")
+            return
+        existing = sheets_read_cell(row_number, PROGRAM_COL, tab=tab)
+        if existing:
+            if existing != program:
+                logger.info(f"Program {PROGRAM_COL}{row_number} already '{existing}' (product says '{program}') — not overwritten")
+            return
+        sheets_update_cell(row_number, PROGRAM_COL, program, tab=tab)
+        logger.info(f"Program {PROGRAM_COL}{row_number} set to '{program}' from '{product_name}'")
+    except Exception as e:
+        logger.error(f"record_program failed for row {row_number}: {e}")
+
+
 def read_deposit_aud(row_number: int, tab: str = "Sales Calls") -> float:
     """Deposit already logged on this row, in AUD. 0.0 when blank or unreadable."""
     raw = sheets_read_cell(row_number, DEPOSIT_COL, tab=tab)
@@ -1210,6 +1254,7 @@ def handle_opportunity_won(body: dict):
         num_payments = 1
         contracted_revenue_aud = 0.0
         found_data = False
+        won_product_name = ""
         is_primary = True
 
         if best_sub:
@@ -1256,6 +1301,7 @@ def handle_opportunity_won(body: dict):
                     amount_aud = charge_aud
                     num_payments = 1
                     contracted_revenue_aud = amount_aud
+                    won_product_name = (charge.get("description") if isinstance(charge, dict) else getattr(charge, "description", "")) or ""
                     found_data = True
                     logger.info(f"Found recent successful charge for {email} [fallback]")
                     break
@@ -1267,6 +1313,7 @@ def handle_opportunity_won(body: dict):
                 value_input_option="USER_ENTERED",
             )
             logger.info(f"Updated financial data for {email} from Stripe lookup")
+            record_program(existing_row, won_product_name)
             if not is_primary:
                 logger.info(f"Fallback strategy used for {email} — highlighting row orange")
                 sheets_highlight_row(existing_row, 1.0, 200 / 255, 100 / 255)
@@ -2003,6 +2050,9 @@ def handle_stripe_payment(event: dict):
                 f"Cash Collected (column I) already has a value ('{existing_cash}'). "
                 f"Subsequent instalment payment ignored to preserve original sale data."
             )
+            # The GHL "won" handler may have filled I/J/K first; Program still
+            # needs the product name, which only this payment event carries.
+            record_program(row_num, product_name)
             return
         # A deposit already paid on this row is part of what the client has handed
         # over, so it belongs in Cash Collected. It stays in AI/AJ as the record of
@@ -2032,6 +2082,7 @@ def handle_stripe_payment(event: dict):
         )
         sheets_update_cell(row_num, "R", payment_date, value_input_option="USER_ENTERED")
         logger.info(f"Updated Stripe payment for {customer_email} at row {row_num} (purchase date: {payment_date})")
+        record_program(row_num, product_name)
 
         # Validate: flag row red if Date of Purchase is before Appointment Date
         appt_col = COL["Appointment Time"]  # index 1, column B
@@ -2368,6 +2419,7 @@ def handle_thrivecart_order(payload: dict) -> str:
     existing = sheets_read_cell(row, "I")
     if existing:
         logger.info(f"ThriveCart order {order_id}: row {row} already has Cash Collected '{existing}' — not overwritten")
+        record_program(row, plan_text)
         return f"row {row} already filled"
 
     deposit_aud = read_deposit_aud(row)
@@ -2381,6 +2433,7 @@ def handle_thrivecart_order(payload: dict) -> str:
         value_input_option="USER_ENTERED",
     )
     sheets_update_cell(row, "R", payment_date, value_input_option="USER_ENTERED")
+    record_program(row, plan_text)
     if not confident:
         sheets_highlight_row(row, 1.0, 200 / 255, 100 / 255)  # orange = guessed plan, check it
     logger.info(
