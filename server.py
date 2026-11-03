@@ -87,6 +87,9 @@ ZOOM_CLIENT_ID        = os.environ.get("ZOOM_CLIENT_ID",        "")
 ZOOM_CLIENT_SECRET    = os.environ.get("ZOOM_CLIENT_SECRET",    "")
 ZOOM_WEBINAR_ID       = os.environ.get("ZOOM_WEBINAR_ID",       "")
 ZOOM_WEBINAR_ID_USA   = os.environ.get("ZOOM_WEBINAR_ID_USA",   "")
+# GHL custom field "Zoom Webinar Join Link" (contact.zoom_webinar_join_link).
+# New SRB sub-account id; the old CMM location used S2sPJyNTkufF8hwru7Wz.
+GHL_CF_ZOOM_JOIN_LINK = os.environ.get("GHL_CF_ZOOM_JOIN_LINK", "bn0T9vt3MD6GaNQ2pnKr")
 
 # Fathom (one or more signing secrets, comma-separated)
 FATHOM_WEBHOOK_SECRETS_RAW = os.environ.get("FATHOM_WEBHOOK_SECRETS", "")
@@ -3177,7 +3180,7 @@ def update_ghl_contact_zoom_link(contact_id: str, join_url: str) -> None:
     body = {
         "customFields": [
             {
-                "id": "S2sPJyNTkufF8hwru7Wz",
+                "id": GHL_CF_ZOOM_JOIN_LINK,
                 "field_value": join_url,
             }
         ]
