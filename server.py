@@ -100,25 +100,33 @@ if STRIPE_API_KEY:
     stripe.api_key = STRIPE_API_KEY
 
 # ─── GHL custom field IDs ─────────────────────────────────────
+# SRB moved to a new GHL sub-account (sdOQfxcy44mNyqsTTXdP) week of 20 Oct 2026.
+# Each entry is a tuple tried in order: new-location id first, then the old
+# CMM-location id so contacts still living in the old account keep resolving.
 
-CF_UTM_CALL          = "PIP4Uqb6byKTtlkCdNru"
-CF_UTM_STAGE         = "pbbiyB60QSfnuBZpop1f"
-CF_UTM_SOURCE        = "hQrjQsnMLfIMD8eLTtAY"
-CF_MONTHLY_REVENUE   = "gutrh9bNDSIjw3ot4LUz"  # "What is your current monthly revenue…" → written to column AA (SOB)
+CF_UTM_CALL          = ("E9RIv0CzJtuFShueQXBw", "PIP4Uqb6byKTtlkCdNru")
+CF_UTM_STAGE         = ("SBLijBsiak5M3bQ2Uzjv", "sxqWZKll7NnqjOG0MKbd", "pbbiyB60QSfnuBZpop1f")  # new loc has utm_stage + utm_stage_
+CF_UTM_SOURCE        = ("7NA4m6TvSNDeXJ6lPFQh", "hQrjQsnMLfIMD8eLTtAY")
+CF_UTM_CAMPAIGN      = ("xyfCRADV3Gwgaos6x4pb",)   # First Touch fallback when attributionSource is empty
+CF_UTM_CONTENT       = ("snp7lPN3AfwteoQQe3Gq",)
+# "What is your current monthly revenue…" → column AB (SOB); f4WT… is the
+# webinar-form "What stage of business are you at?" with the same buckets.
+CF_MONTHLY_REVENUE   = ("ZkWQgJOniqezGyYggPJ6", "f4WTSN8ViNwPb251IXEh", "gutrh9bNDSIjw3ot4LUz")
 
 # ─── Custom-field → Sales Calls column mapping ─────────────────
 # Single source of truth: /admin/backfill-custom-fields iterates this list,
 # and handle_appointment_created auto-populates all of them on new bookings.
 # To add a new field: find its GHL id via /admin/list-custom-fields, then
-# add one entry here — no other code changes needed.
+# add one entry here — no other code changes needed. "id" may be a str or a
+# tuple of ids tried in order (first non-empty value wins).
 CUSTOM_FIELD_CONFIG = [
-    {"id": "OYoCcRD4FXKP5hsl4vge", "column": "AA", "label": "Type"},
-    {"id": CF_MONTHLY_REVENUE,     "column": "AB", "label": "SOB"},
-    {"id": "BNovfBpG64gmSqb72am5", "column": "AC", "label": "Goal"},
-    {"id": "XT6kirvh2gaxh3GB1Mqy", "column": "AD", "label": "Roadblock"},
-    {"id": "Wfau5h2I2bRmEQvbFDzB", "column": "AE", "label": "Urgency"},
-    {"id": "Q6WJRK90PcmIfbAups0u", "column": "AF", "label": "Finances"},
-    {"id": "lePODdNwx3T9VPCx42v6", "column": "AG", "label": "Socials"},
+    {"id": ("7HwOWYsC5KrhqpZ0JyEJ", "bJX1pgq4BDyBmpFfaqBT", "OYoCcRD4FXKP5hsl4vge"), "column": "AA", "label": "Type"},
+    {"id": CF_MONTHLY_REVENUE,                                                      "column": "AB", "label": "SOB"},
+    {"id": ("Gbup1I5DFszwLoaZSjVp", "BNovfBpG64gmSqb72am5"),                         "column": "AC", "label": "Goal"},
+    {"id": ("1mH6ajvqzx10UkH3rJz6", "XT6kirvh2gaxh3GB1Mqy"),                         "column": "AD", "label": "Roadblock"},
+    {"id": ("RZObIlyUZmVZz0dG0HQl", "Wfau5h2I2bRmEQvbFDzB"),                         "column": "AE", "label": "Urgency"},
+    {"id": ("6QDWwlBEOzdRufkgwTLh", "Q6WJRK90PcmIfbAups0u"),                         "column": "AF", "label": "Finances"},
+    {"id": ("e214tzkuVIwb1B6RZahw", "aZB8aWmjOG37qSmmoN2z", "lePODdNwx3T9VPCx42v6"), "column": "AG", "label": "Socials"},
 ]
 
 # ─── User ID → Name mapping ───────────────────────────────────
@@ -431,11 +439,9 @@ def ghl_mark_latest_appointment_noshow(contact_id: str) -> tuple[bool, str]:
         return False, f"update error: {e}"
 
 
-def get_cf_value(contact: dict, field_id: str) -> str:
-    for cf in contact.get("customFields", []):
-        if cf.get("id") == field_id:
-            return str(cf.get("value", "")).strip()
-    return ""
+def get_cf_value(contact: dict, field_id) -> str:
+    """field_id may be a str or a tuple of ids tried in order."""
+    return _extract_custom_field(contact, field_id)
 
 
 def ghl_find_contact_by_email(email: str) -> dict:
@@ -1478,6 +1484,12 @@ def handle_appointment_created(body: dict):
     if contact:
         ft_campaign, ft_ad = _extract_attribution_fields(contact.get("attributionSource", {}) or {})
         lt_campaign, lt_ad = _extract_attribution_fields(contact.get("lastAttributionSource", {}) or {})
+        # Imported contacts (new sub-account) have no attributionSource; fall
+        # back to the utm_campaign / utm_content custom fields set by the form.
+        if not ft_campaign:
+            ft_campaign = get_cf_value(contact, CF_UTM_CAMPAIGN).upper()
+        if not ft_ad:
+            ft_ad = get_cf_value(contact, CF_UTM_CONTENT).upper()
         for cf in CUSTOM_FIELD_CONFIG:
             val = _extract_custom_field(contact, cf["id"])
             if val:
@@ -3499,15 +3511,21 @@ def _country_from_phone(phone: str) -> str:
     return ""
 
 
-def _extract_custom_field(contact: dict, field_id: str) -> str:
-    """Get the value of a specific custom field from a GHL contact by internal
-    field id. GHL's contact API only returns custom fields with their internal
-    id (not the merge key), so id-based matching is the reliable path."""
+def _extract_custom_field(contact: dict, field_id) -> str:
+    """Get the value of a custom field from a GHL contact by internal field id.
+    GHL's contact API only returns custom fields with their internal id (not
+    the merge key), so id-based matching is the reliable path. `field_id` may
+    be a str or a tuple/list of ids tried in order; first non-empty wins."""
     if not contact or not isinstance(contact, dict) or not field_id:
         return ""
+    ids = (field_id,) if isinstance(field_id, str) else tuple(field_id)
+    values = {}
     for cf in contact.get("customFields", []) or []:
-        if isinstance(cf, dict) and cf.get("id") == field_id:
-            return str(cf.get("value") or "").strip()
+        if isinstance(cf, dict) and cf.get("id") in ids:
+            values[cf.get("id")] = str(cf.get("value") or "").strip()
+    for fid in ids:
+        if values.get(fid):
+            return values[fid]
     return ""
 
 
